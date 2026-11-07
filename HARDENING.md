@@ -114,7 +114,16 @@ offering them the corresponding source of the modified version.
 > 127.0.0.1:8787, bbot 3.0.2 running as uid 10001). Re-verify after changing any version
 > pin: `docker build --progress=plain -t artex:local .`
 >
-> Size: 6.49 GB → 2.87 GB (`docker system df -v`). Removed: 1.5 GB of bbot build junk in
-> `/root` (tool cache + gcc/make/libssl-dev/ansible installs), 92 MB pip cache, 55 MB npm
-> cache, and the 422 MB headed Chromium that `--headless` never starts. `/usr` also drops
-> from 1.70 GB to 1.12 GB now that bbot's build tooling stays in the `bbotdeps` stage.
+> Size: 6.49 GB → 2.58 GB (`docker system df -v`; 1.83 GB measured with `du`). Removed:
+> 1.5 GB of bbot build junk in `/root` (tool cache + gcc/make/libssl-dev/ansible installs),
+> 92 MB pip cache, 55 MB npm cache, the 422 MB headed Chromium that `--headless` never
+> starts, 173 MB of Xvfb/mesa/libLLVM-15 that `--with-deps` installs for headed rendering
+> (headless Chromium uses the bundled SwiftShader; screenshots and WebGL verified after
+> removal), ~43 MB of `vim` + vim-runtime (no skill invokes it), and 7 MB of Node headers.
+>
+> What is left is mostly functional: `/opt/bbot` 508 MB (of which 234 MB is the unpinned
+> module deps above), `/ms-playwright` 288 MB (headless shell + ffmpeg), the six Go tools
+> in `/usr/local/bin` ~436 MB (already stripped; nuclei alone is 177 MB), Node 124 MB and
+> Python 3.12. The three ways to go lower are capability trades, not cleanup: install bbot
+> module deps only for the modules the skill uses (-234 MB, breaks ad-hoc modules), drop
+> bbot (-508 MB), or drop the browser MCP (-412 MB for Playwright + Node).

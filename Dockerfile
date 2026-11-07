@@ -100,7 +100,7 @@ ARG TARGETARCH
 COPY --from=web /usr/local /usr/local
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates ripgrep curl wget vim git jq unzip \
+      ca-certificates ripgrep curl wget git jq unzip \
       dnsutils iputils-ping netcat-openbsd inetutils-telnet whois nmap \
       p7zip-full xz-utils \
     && rm -rf /var/lib/apt/lists/* \
@@ -214,7 +214,14 @@ RUN npm install -g --no-fund --no-audit \
     # headless Chromium runs the chromium-headless-shell build, so the ~420 MB headed
     # Chromium never starts. Drop it; ffmpeg stays (screenshots/video need it).
     && playwright install --with-deps --only-shell chromium \
-    && rm -rf /var/lib/apt/lists/* /root/.npm /root/.cache/node
+    # --with-deps also pulls Xvfb and mesa for headed rendering: libgl1-mesa-dri
+    # drags in libLLVM-15 (112 MB) plus 25 MB of dri drivers. Headless Chromium
+    # renders through the bundled SwiftShader instead; verified that screenshots and
+    # a WebGL context still work with all of it removed (~170 MB).
+    && apt-get purge -y -qq xvfb libgl1-mesa-dri libglx-mesa0 libgl1 libglx0 \
+    && apt-get autoremove -y -qq --purge \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt \
+              /root/.npm /root/.cache/node /usr/local/include/node
 
 WORKDIR /app
 # Binary compiled from source in the build stage above.
