@@ -18,7 +18,7 @@
 # ---------------------------------------------------------------- frontend ---
 # Pinned to the Node 22 line the CI/release workflows use. On the build platform
 # only; the frontend static export is architecture-independent.
-FROM --platform=$BUILDPLATFORM node:22-bookworm-slim@sha256:5ec23b7c622b00547753bc6ffd78085dd868a68aeb41c8e0a1418f033e13d96d AS web
+FROM --platform=$BUILDPLATFORM node:22.23.4-bookworm-slim@sha256:5ec23b7c622b00547753bc6ffd78085dd868a68aeb41c8e0a1418f033e13d96d AS web
 WORKDIR /src/web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci --ignore-scripts
@@ -29,7 +29,7 @@ RUN npm run build:static
 # Pinned to the Go 1.26 line (matches go.mod and the release binaries job). The
 # binary is CGO-free, so this stage runs on the build platform and cross-compiles
 # to $TARGETARCH without QEMU.
-FROM --platform=$BUILDPLATFORM golang:1.26-bookworm@sha256:5de7c99eb78ca5e515a4c340235d0955ec5964a5071c492c15503d7c267da473 AS build
+FROM --platform=$BUILDPLATFORM golang:1.26.10-bookworm@sha256:5de7c99eb78ca5e515a4c340235d0955ec5964a5071c492c15503d7c267da473 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -49,7 +49,7 @@ RUN ARTEX_SKIP_FRONTEND=1 \
     bash ./build.sh --target "${TARGETOS:-linux}/${TARGETARCH:-amd64}"
 
 # ---------------------------------------------------------------- runtime ---
-FROM python:3.12-slim-bookworm@sha256:935c3c5b12357a7e10caa9c1e6ca5692344d97cf229832ef584be2cec9fc03df
+FROM python:3.12.16-slim-bookworm@sha256:935c3c5b12357a7e10caa9c1e6ca5692344d97cf229832ef584be2cec9fc03df
 ARG TARGETARCH
 
 # Node 22 comes from the pinned build stage above rather than
