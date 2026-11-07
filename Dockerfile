@@ -182,7 +182,9 @@ COPY --from=build /out/artex /app/artex
 # to artex — docker stop only signals PID 1; without forwarding, artex never receives it,
 # cannot shut down gracefully, and is hard-killed by SIGKILL after 10 seconds.
 COPY start.sh /app/start.sh
-RUN chmod +x /app/artex /app/start.sh && mkdir -p /app/keys /app/data
+COPY docker-entrypoint.sh /app/docker-entrypoint.sh
+RUN chmod +x /app/artex /app/start.sh /app/docker-entrypoint.sh \
+    && mkdir -p /app/keys /app/data
 
 # persistence points: data/ (SQLite, task files) and keys/ (jwt.key, via ARTEX_JWT_KEY_DIR)
 # Only the writable paths are handed to the runtime user; the binary and skills stay
@@ -196,6 +198,11 @@ COPY skills/ /app/skills/
 VOLUME ["/app/data", "/app/keys"]
 EXPOSE 8787 8788
 ENV HOME=/home/artex
+# Default user is unprivileged. docker-compose.yml overrides this with `user: "0:0"`
+# because it bind-mounts ./data and ./keys from the host (created root-owned by the
+# daemon); the entrypoint then chowns those two paths and drops back to uid 10001
+# with setpriv before artex runs. A plain `docker run` without host bind mounts, and
+# `kubectl` with runAsNonRoot, use uid 10001 directly and skip the handover.
 USER artex
-ENTRYPOINT ["/app/start.sh"]
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
 CMD ["-addr", ":8787", "-proxy", ":8788"]

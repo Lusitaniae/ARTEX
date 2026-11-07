@@ -23,6 +23,10 @@ services:
       args:
         ARTEX_VERSION: ${ARTEX_VERSION:-dev}
     image: artex:local
+    # The image runs as uid 10001. Start it as root so docker-entrypoint.sh can hand
+    # the bind-mounted ./data and ./keys (created root-owned by the daemon) to that
+    # user; the entrypoint then drops privileges, so artex itself is never root.
+    user: "0:0"
     depends_on:
       postgres:
         condition: service_healthy

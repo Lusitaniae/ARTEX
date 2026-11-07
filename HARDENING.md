@@ -36,6 +36,10 @@ scripts/verify-provenance.sh release BaaRai/ARTEX v0.5.1 artex-0.5.1-linux-amd64
    Playwright packages are pinned to exact versions instead of `@latest`.
 4. **Container runs unprivileged** (`uid 10001`). `/app/artex` and `/app/skills` stay
    root-owned and read-only; only `/app/data` and `/app/keys` are writable.
+   Under compose, `docker-entrypoint.sh` starts as root, hands those two volumes to
+   `uid 10001` (compose bind-mounts them from the host, where the daemon creates them
+   root-owned) and then `exec`s `setpriv --reuid=10001 --regid=10001`; artex and the
+   agents it spawns never run as root.
 5. **Base images pinned by digest** — `python:3.12-slim-bookworm`, `node:22-bookworm-slim`
    and `golang:1.26-bookworm` are referenced by multi-arch index digest, so a re-tagged
    base image cannot change what is built.
@@ -54,6 +58,13 @@ scripts/verify-provenance.sh release BaaRai/ARTEX v0.5.1 artex-0.5.1-linux-amd64
   the flag and preinstall only the modules you use from your own locked list.
 - The image build is not byte-reproducible (apt/pip/npm fetch at build time, and
   `npm ci` resolves from the lockfile's registry URLs).
+- PID 1 of the container starts as root for the `/app/data` + `/app/keys` ownership
+  handover before dropping to `uid 10001`. This only happens under `docker-compose.yml`,
+  which sets `user: "0:0"` because it bind-mounts those paths from the host; the image
+  default is `USER artex`, so `docker run` without host bind mounts (and
+  `runAsNonRoot` in Kubernetes) start directly as `uid 10001`. Running the compose file
+  with `--user 10001` skips the handover, and then the host directories must already be
+  owned by `10001:10001`.
 - The `bot.yml` workflow sends issue/PR text to DeepSeek and holds a token with
   `issues: write`. It cannot push code (`contents: read`). Delete that workflow in a
   private fork if you don't want it.
@@ -70,7 +81,7 @@ git rebase --onto origin/v0.x.y <old-upstream-tag> hardening/local
 If this fork is ever served to other people over a network, AGPL-3.0 §13 requires
 offering them the corresponding source of the modified version.
 
-> Status: these Dockerfile changes were **not built** in the environment where they
-> were written (no Docker available). Validate with `docker build .` before relying on
-> them; the hash values come from each vendor's published checksums file and are
-> correct as of the versions pinned above.
+> Status: the image builds and runs. Verified locally with `docker build -t artex:local .`
+> plus `docker compose up -d --no-build` (postgres + artex healthy, UI answering on
+> 127.0.0.1:8787), and the pinned hashes/images were resolved during that build. Re-verify
+> after changing any version pin: `docker build --progress=plain -t artex:local .`.
