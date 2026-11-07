@@ -48,6 +48,48 @@ RUN ARTEX_SKIP_FRONTEND=1 \
     ARTEX_BUILD_VERSION="${ARTEX_VERSION}" \
     bash ./build.sh --target "${TARGETOS:-linux}/${TARGETARCH:-amd64}"
 
+# ------------------------------------------------------------------ bbot ---
+# bbot's own dependency installer (`--install-all-deps`) does three things that
+# must not land in the runtime image: it apt-installs build tooling (gcc, make,
+# libssl-dev, 7z, xz), it pip-installs per-module Python deps (django, numpy,
+# kreuzberg, ...), and its dry-run downloads bbot's per-module *tool* cache
+# (a second Chromium, a second Node, jadx, trufflehog, gowitness — ~1.5 GB) into
+# $HOME/.bbot. Only the venv is carried into the final image, so the tooling and
+# the tool cache are built here and thrown away. They were also unreadable at
+# runtime: they lived in /root, and the container runs as uid 10001.
+FROM python:3.12.16-slim-bookworm@sha256:935c3c5b12357a7e10caa9c1e6ca5692344d97cf229832ef584be2cec9fc03df AS bbotdeps
+ARG BBOT_VERSION=3.0.2
+
+# Prepare bbot under the *runtime* user's home, not root's. bbot records completed
+# core-dependency installs in ~/.bbot/cache/<hash> and skips the installer when the
+# marker is there; without it the installer shells out to `sudo` for apt, which does
+# not exist in the runtime image and which bbot does not handle (FileNotFoundError
+# escapes can_sudo_without_password and aborts the scan). Pre-seeding the marker and
+# the ansible collection under /home/artex makes bbot work as uid 10001.
+ENV HOME=/home/artex
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates git curl xz-utils \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /home/artex
+COPY requirements-bbot.lock /tmp/requirements-bbot.lock
+RUN set -eux; \
+    python -m venv /opt/bbot; \
+    /opt/bbot/bin/pip install --no-cache-dir --require-hashes -r /tmp/requirements-bbot.lock; \
+    /opt/bbot/bin/python -c 'import bbot, sys; assert bbot.__version__ == sys.argv[1], bbot.__version__' "$BBOT_VERSION"; \
+    rm -f /tmp/requirements-bbot.lock; \
+    ln -s /opt/bbot/bin/bbot /usr/local/bin/bbot; \
+    PIP_NO_CACHE_DIR=1 bbot -y --install-all-deps; \
+    bbot --version >/dev/null; \
+    bbot --dry-run -t example.com -m wafw00f,paramminer_getparams,lightfuzz,sslcert,gowitness >/dev/null 2>&1 || true; \
+    bbot --dry-run -t example.com -m wafw00f,paramminer_getparams,lightfuzz,sslcert,gowitness --no-color >/tmp/bbot-dry.log 2>&1 || true; \
+    ! grep -qE "Installing|ERRR|CRITICAL" /tmp/bbot-dry.log || { cat /tmp/bbot-dry.log; exit 1; }; \
+    # Keep the core-dep marker, the ansible collection and the bbot config; drop the
+    # tool cache (~1.5 GB of a second chrome/node/jadx/trufflehog) and run leftovers.
+    # Tools re-download into the same place on first use, as uid 10001.
+    rm -rf /home/artex/.bbot/tools /home/artex/.bbot/temp /home/artex/.bbot/logs \
+           /home/artex/.bbot/scans /home/artex/.ansible/galaxy_cache \
+           /home/artex/.cache /tmp/bbot-dry.log
+
 # ---------------------------------------------------------------- runtime ---
 FROM python:3.12.16-slim-bookworm@sha256:935c3c5b12357a7e10caa9c1e6ca5692344d97cf229832ef584be2cec9fc03df
 ARG TARGETARCH
@@ -60,6 +102,7 @@ COPY --from=web /usr/local /usr/local
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates ripgrep curl wget vim git jq unzip \
       dnsutils iputils-ping netcat-openbsd inetutils-telnet whois nmap \
+      p7zip-full xz-utils \
     && rm -rf /var/lib/apt/lists/* \
     && node --version && npm --version
 
@@ -144,20 +187,15 @@ RUN set -eux; \
 # isolate it from the image python, installed from a fully hashed lock
 # (requirements-bbot.lock, 68 packages, generated for cp312 on amd64 and arm64).
 # Module dependencies are preinstalled (--install-all-deps) so scans never need pip
-# at runtime, which would fail under a program's egress allowlist.
-ARG BBOT_VERSION=3.0.2
-COPY requirements-bbot.lock /tmp/requirements-bbot.lock
-RUN set -eux; \
-    python -m venv /opt/bbot; \
-    /opt/bbot/bin/pip install --no-cache-dir --require-hashes -r /tmp/requirements-bbot.lock; \
-    /opt/bbot/bin/python -c 'import bbot, sys; assert bbot.__version__ == sys.argv[1], bbot.__version__' "$BBOT_VERSION"; \
-    rm -f /tmp/requirements-bbot.lock; \
-    ln -s /opt/bbot/bin/bbot /usr/local/bin/bbot; \
-    bbot -y --install-all-deps; \
-    bbot --version >/dev/null; \
-    bbot --dry-run -t example.com -m wafw00f,paramminer_getparams,lightfuzz,sslcert,gowitness >/dev/null 2>&1 || true; \
-    bbot --dry-run -t example.com -m wafw00f,paramminer_getparams,lightfuzz,sslcert,gowitness --no-color >/tmp/bbot-dry.log 2>&1 || true; \
-    ! grep -qE "Installing|ERRR|CRITICAL" /tmp/bbot-dry.log || { cat /tmp/bbot-dry.log; exit 1; }
+# at runtime, which would fail under a program's egress allowlist. Built in the
+# bbotdeps stage above; only the venv is copied, so the build tooling and the
+# build-time tool cache stay out of this image.
+COPY --from=bbotdeps /opt/bbot /opt/bbot
+RUN ln -s /opt/bbot/bin/bbot /usr/local/bin/bbot
+# bbot's prepared home: core-dep marker in .bbot/cache, ansible collection, config.
+COPY --from=bbotdeps /home/artex/.bbot /home/artex/.bbot
+COPY --from=bbotdeps /home/artex/.ansible /home/artex/.ansible
+COPY --from=bbotdeps /home/artex/.config /home/artex/.config
 
 # Preinstall Playwright MCP and CLI (globally) so no npx network download is needed
 # at runtime. Exact versions, not @latest: @latest makes the image non-reproducible
@@ -172,8 +210,11 @@ RUN npm install -g --no-fund --no-audit \
         "@playwright/cli@${PLAYWRIGHT_CLI_VERSION}" \
         "playwright@${PLAYWRIGHT_VERSION}" \
     && playwright-cli --help \
-    && playwright install --with-deps chromium \
-    && rm -rf /var/lib/apt/lists/*
+    # --only-shell: ARTEX launches @playwright/mcp with --headless (db/db.go), and
+    # headless Chromium runs the chromium-headless-shell build, so the ~420 MB headed
+    # Chromium never starts. Drop it; ffmpeg stays (screenshots/video need it).
+    && playwright install --with-deps --only-shell chromium \
+    && rm -rf /var/lib/apt/lists/* /root/.npm /root/.cache/node
 
 WORKDIR /app
 # Binary compiled from source in the build stage above.
@@ -192,7 +233,7 @@ RUN chmod +x /app/artex /app/start.sh /app/docker-entrypoint.sh \
 RUN groupadd --gid 10001 artex \
     && useradd --uid 10001 --gid artex --home-dir /home/artex --create-home \
                --shell /usr/sbin/nologin artex \
-    && chown -R artex:artex /app/data /app/keys \
+    && chown -R artex:artex /app/data /app/keys /home/artex \
     && chmod -R a+rX /ms-playwright
 COPY skills/ /app/skills/
 VOLUME ["/app/data", "/app/keys"]

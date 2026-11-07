@@ -12,6 +12,12 @@ JSON. Use it for breadth. Keep the single-purpose tools (subfinder, httpx,
 katana, ffuf, nuclei) when you need exact control over individual requests or
 a single host.
 
+Python module dependencies are preinstalled; bbot's per-module *tools* are not.
+The first scan that uses a module downloads that tool into
+`/home/artex/.bbot/tools` (Chromium, node, jadx, trufflehog, … — up to ~1.5 GB,
+once per container). Run `/usr/local/bin/bbot --version` once after startup to
+confirm the config is usable before a scan that has a time budget.
+
 ## Hard gates (read before running anything)
 
 1. **Authorization**: targets and seeds must be inside the task's authorized

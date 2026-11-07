@@ -23,7 +23,7 @@ scripts/verify-provenance.sh upstream v0.3.15 e6ec56999175509551a1e43a3ee3b053d0
 scripts/verify-provenance.sh release BaaRai/ARTEX v0.5.1 artex-0.5.1-linux-amd64.zip
 ```
 
-## Changes in this fork (6)
+## Changes in this fork (8)
 
 1. **Tool archives are hash-pinned.** nuclei, httpx, subfinder, katana, ffuf and dalfox
    are verified against a SHA-256 pinned in the `Dockerfile` for both `amd64` and
@@ -48,14 +48,42 @@ scripts/verify-provenance.sh release BaaRai/ARTEX v0.5.1 artex-0.5.1-linux-amd64
    architectures) is installed with `pip --require-hashes`, and the import is checked
    against `BBOT_VERSION`. Verified by installing the lock under `--require-hashes` on
    CPython 3.12 before committing it.
+7. **`bbot` is built in a throwaway stage** — `--install-all-deps` apt-installs gcc,
+   make, libssl-dev, 7z and xz, pip-installs 40 module packages (django, numpy,
+   kreuzberg, …), and its dry-run downloads bbot's per-module *tool* cache into `$HOME`
+   (a second Chromium 693 MB, a second Node 164 MB, jadx 110 MB, trufflehog 34 MB,
+   gowitness 47 MB — 1.5 GB total). Only `/opt/bbot` plus bbot's config, the core-dep
+   marker and the ansible collection are copied into the runtime image; the build
+   tooling and the tool cache never are. They were also unusable before: they lived in
+   `/root`, which uid 10001 cannot read, so the image carried 1.5 GB that nothing could
+   use. Tools download into `/home/artex/.bbot/tools` on first use instead.
+8. **`bbot` works unprivileged** — bbot's installer skips core deps when
+   `~/.bbot/cache/<hash>` exists and otherwise shells out to `sudo`, which the runtime
+   image does not have (bbot only catches `CalledProcessError`, so the missing binary
+   aborted the scan with `FileNotFoundError`). The build seeds the marker, the
+   `bbot.yml`/`secrets.yml` config and the ansible collection under `/home/artex`, and
+   the runtime image hands that directory to uid 10001, so bbot starts without root.
+   Verified: `bbot --dry-run -m wafw00f,sslcert,paramminer_getparams` → `Setup
+   succeeded for 13/13 modules`, exit 0, as uid 10001.
 
 ## Not covered (know what this does not protect against)
 
 - `apt-get` packages are version-constrained by the digest-pinned base image but are not
   individually hash-pinned; Debian security updates will change them between builds.
-- `bbot -y --install-all-deps` installs bbot's *module* dependencies into the venv after
-  the hashed lock. Those extra packages are not hash-verified. If that matters, drop
-  the flag and preinstall only the modules you use from your own locked list.
+- `bbot -y --install-all-deps` installs 40 distributions beyond the 68 in the hashed
+  lock: django 5.2.19, numpy 2.5.4, kreuzberg 4.4.6, sqlalchemy 2.1.8, zstandard,
+  asyncpg, pymysql, pymongo, aiokafka, neo4j, baddns, badsecrets, flask-unsign,
+  wafw00f, … (≈234 MB of the 508 MB venv). They are **unpinned and unhashed**: pip
+  resolves the newest compatible release at build time, so two builds of this
+  Dockerfile can ship different code. The set is recorded in
+  `BBOT-MODULE-DEPS.md`; pinning it would mean generating a second hashed lock
+  for those 40 (plus their transitive deps) and dropping the flag for the modules you
+  use.
+- bbot's per-module tool cache is no longer baked in. On first use each module
+  downloads its tools (chromium, node, jadx, trufflehog, gowitness, …) into
+  `/home/artex/.bbot/tools`, up to ~1.5 GB. That needs egress to the vendors' release
+  hosts; under a strict allowlist, either allow those hosts or pre-seed the directory
+  as uid 10001 and accept the image size.
 - The image build is not byte-reproducible (apt/pip/npm fetch at build time, and
   `npm ci` resolves from the lockfile's registry URLs).
 - PID 1 of the container starts as root for the `/app/data` + `/app/keys` ownership
@@ -83,5 +111,10 @@ offering them the corresponding source of the modified version.
 
 > Status: the image builds and runs. Verified locally with `docker build -t artex:local .`
 > plus `docker compose up -d --no-build` (postgres + artex healthy, UI answering on
-> 127.0.0.1:8787), and the pinned hashes/images were resolved during that build. Re-verify
-> after changing any version pin: `docker build --progress=plain -t artex:local .`.
+> 127.0.0.1:8787, bbot 3.0.2 running as uid 10001). Re-verify after changing any version
+> pin: `docker build --progress=plain -t artex:local .`
+>
+> Size: 6.49 GB → 2.87 GB (`docker system df -v`). Removed: 1.5 GB of bbot build junk in
+> `/root` (tool cache + gcc/make/libssl-dev/ansible installs), 92 MB pip cache, 55 MB npm
+> cache, and the 422 MB headed Chromium that `--headless` never starts. `/usr` also drops
+> from 1.70 GB to 1.12 GB now that bbot's build tooling stays in the `bbotdeps` stage.
