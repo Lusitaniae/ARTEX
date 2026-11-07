@@ -18,7 +18,7 @@
 # ---------------------------------------------------------------- frontend ---
 # Pinned to the Node 22 line the CI/release workflows use. On the build platform
 # only; the frontend static export is architecture-independent.
-FROM --platform=$BUILDPLATFORM node:22-bookworm-slim AS web
+FROM --platform=$BUILDPLATFORM node:22-bookworm-slim@sha256:5ec23b7c622b00547753bc6ffd78085dd868a68aeb41c8e0a1418f033e13d96d AS web
 WORKDIR /src/web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci --ignore-scripts
@@ -29,7 +29,7 @@ RUN npm run build:static
 # Pinned to the Go 1.26 line (matches go.mod and the release binaries job). The
 # binary is CGO-free, so this stage runs on the build platform and cross-compiles
 # to $TARGETARCH without QEMU.
-FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS build
+FROM --platform=$BUILDPLATFORM golang:1.26-bookworm@sha256:5de7c99eb78ca5e515a4c340235d0955ec5964a5071c492c15503d7c267da473 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -49,7 +49,7 @@ RUN ARTEX_SKIP_FRONTEND=1 \
     bash ./build.sh --target "${TARGETOS:-linux}/${TARGETARCH:-amd64}"
 
 # ---------------------------------------------------------------- runtime ---
-FROM python:3.12-slim-bookworm
+FROM python:3.12-slim-bookworm@sha256:935c3c5b12357a7e10caa9c1e6ca5692344d97cf229832ef584be2cec9fc03df
 ARG TARGETARCH
 
 # Node 22 comes from the pinned build stage above rather than
@@ -140,14 +140,18 @@ RUN set -eux; \
     ffuf -V >/dev/null; dalfox --version >/dev/null 2>&1 || true; sqlmap --version >/dev/null
 
 # bbot recursive recon orchestrator (#117): blacklanternsecurity/bbot, AGPL-3.0
-# (same license as ARTEX; standalone CLI dependency, not linked code). Pinned
-# version, own venv to isolate from the image python. Module dependencies are
-# preinstalled (--install-all-deps) so scans never need pip at runtime, which
-# would fail under a program's egress allowlist.
+# (same license as ARTEX; standalone CLI dependency, not linked code). Own venv to
+# isolate it from the image python, installed from a fully hashed lock
+# (requirements-bbot.lock, 68 packages, generated for cp312 on amd64 and arm64).
+# Module dependencies are preinstalled (--install-all-deps) so scans never need pip
+# at runtime, which would fail under a program's egress allowlist.
 ARG BBOT_VERSION=3.0.2
+COPY requirements-bbot.lock /tmp/requirements-bbot.lock
 RUN set -eux; \
     python -m venv /opt/bbot; \
-    /opt/bbot/bin/pip install --no-cache-dir "bbot==${BBOT_VERSION}"; \
+    /opt/bbot/bin/pip install --no-cache-dir --require-hashes -r /tmp/requirements-bbot.lock; \
+    /opt/bbot/bin/python -c 'import bbot, sys; assert bbot.__version__ == sys.argv[1], bbot.__version__' "$BBOT_VERSION"; \
+    rm -f /tmp/requirements-bbot.lock; \
     ln -s /opt/bbot/bin/bbot /usr/local/bin/bbot; \
     bbot -y --install-all-deps; \
     bbot --version >/dev/null; \

@@ -23,7 +23,7 @@ scripts/verify-provenance.sh upstream v0.3.15 e6ec56999175509551a1e43a3ee3b053d0
 scripts/verify-provenance.sh release BaaRai/ARTEX v0.5.1 artex-0.5.1-linux-amd64.zip
 ```
 
-## Changes in this fork (4)
+## Changes in this fork (6)
 
 1. **Tool archives are hash-pinned.** nuclei, httpx, subfinder, katana, ffuf and dalfox
    are verified against a SHA-256 pinned in the `Dockerfile` for both `amd64` and
@@ -36,15 +36,24 @@ scripts/verify-provenance.sh release BaaRai/ARTEX v0.5.1 artex-0.5.1-linux-amd64
    Playwright packages are pinned to exact versions instead of `@latest`.
 4. **Container runs unprivileged** (`uid 10001`). `/app/artex` and `/app/skills` stay
    root-owned and read-only; only `/app/data` and `/app/keys` are writable.
+5. **Base images pinned by digest** — `python:3.12-slim-bookworm`, `node:22-bookworm-slim`
+   and `golang:1.26-bookworm` are referenced by multi-arch index digest, so a re-tagged
+   base image cannot change what is built.
+6. **`bbot` installed from a hashed lock** — `requirements-bbot.lock` (68 packages,
+   generated with `uv pip compile --generate-hashes` for cp312 on both manylinux
+   architectures) is installed with `pip --require-hashes`, and the import is checked
+   against `BBOT_VERSION`. Verified by installing the lock under `--require-hashes` on
+   CPython 3.12 before committing it.
 
 ## Not covered (know what this does not protect against)
 
-- `bbot` is version-pinned (`3.0.2`) but not hash-pinned: `pip` is invoked without
-  `--require-hashes`. Adding a hashed `requirements.txt` is the next step if you care.
-- `apt-get` packages and the base images are tag-pinned, not digest-pinned. For a
-  reproducible build, pin `python:3.12-slim-bookworm@sha256:…`,
-  `node:22-bookworm-slim@sha256:…` and `golang:1.26-bookworm@sha256:…`.
-- The image build is not byte-reproducible (pip/npm/apt fetch at build time).
+- `apt-get` packages are version-constrained by the digest-pinned base image but are not
+  individually hash-pinned; Debian security updates will change them between builds.
+- `bbot -y --install-all-deps` installs bbot's *module* dependencies into the venv after
+  the hashed lock. Those extra packages are not hash-verified. If that matters, drop
+  the flag and preinstall only the modules you use from your own locked list.
+- The image build is not byte-reproducible (apt/pip/npm fetch at build time, and
+  `npm ci` resolves from the lockfile's registry URLs).
 - The `bot.yml` workflow sends issue/PR text to DeepSeek and holds a token with
   `issues: write`. It cannot push code (`contents: read`). Delete that workflow in a
   private fork if you don't want it.
