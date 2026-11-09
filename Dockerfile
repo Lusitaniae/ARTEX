@@ -242,6 +242,26 @@ RUN groupadd --gid 10001 artex \
                --shell /usr/sbin/nologin artex \
     && chown -R artex:artex /app/data /app/keys /home/artex \
     && chmod -R a+rX /ms-playwright
+
+# ---------------------------------------------------------- nuclei templates ---
+# nuclei v3 installs its templates on first run. That is a silent failure whenever
+# the container cannot reach github.com (the default posture: a scoped egress
+# allowlist), where it logs "nuclei-templates are not installed, installing...",
+# then "no templates found in path" and still exits 0. Bake them so the runtime
+# needs no egress, the template set is reproducible, and a scan cannot start with
+# an empty template directory. Tag and commit are both pinned; the build fails if
+# the tag moves.
+ARG NUCLEI_TEMPLATES_VERSION=v10.5.1
+ARG NUCLEI_TEMPLATES_COMMIT=79fb682760ab3d5b0e22afbb44709353cbebf023
+RUN set -eux; \
+    git clone -q --depth 1 --branch "$NUCLEI_TEMPLATES_VERSION" \
+      https://github.com/projectdiscovery/nuclei-templates /home/artex/nuclei-templates; \
+    test "$(git -C /home/artex/nuclei-templates rev-parse HEAD)" = "$NUCLEI_TEMPLATES_COMMIT"; \
+    rm -rf /home/artex/nuclei-templates/.git; \
+    chown -R artex:artex /home/artex/nuclei-templates; \
+    count="$(find /home/artex/nuclei-templates -name "*.yaml" | wc -l)"; \
+    echo "baked nuclei templates: $count"; \
+    test "$count" -gt 10000
 COPY skills/ /app/skills/
 VOLUME ["/app/data", "/app/keys"]
 EXPOSE 8787 8788
