@@ -1,7 +1,12 @@
 name: release
+# NEUTRALISED IN THIS FORK.
+#
+# Upstream trigger was `push: tags: ["v*"]`, which built 5-platform release zips and
+# pushed multi-arch images to ghcr.io tagged `latest` — i.e. every tag made this repo
+# the publisher of the artifact the hardening baseline tells operators never to pull.
+# See SECURITY-REVIEW.md §F6. Manual dispatch only; nothing publishes on a tag now.
 on:
-  push:
-    tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write # required to create the Release
