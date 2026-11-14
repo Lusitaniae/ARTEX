@@ -81,7 +81,7 @@ RUN set -eux; \
     PIP_NO_CACHE_DIR=1 bbot -y --install-all-deps; \
     bbot --version >/dev/null; \
     bbot --dry-run -t example.com -m wafw00f,paramminer_getparams,lightfuzz,sslcert,gowitness >/dev/null 2>&1 || true; \
-    bbot --dry-run -t example.com -m wafw00f,paramminer_getparams,lightfuzz,sslcert,gowitness --no-color >/tmp/bbot-dry.log 2>&1 || true; \
+    bbot --dry-run -t example.com -m wafw00f,paramminer_getparams,lightfuzz,sslcert,gowitness >/tmp/bbot-dry.log 2>&1 || true; \
     ! grep -qE "Installing|ERRR|CRITICAL" /tmp/bbot-dry.log || { cat /tmp/bbot-dry.log; exit 1; }; \
     # Keep the core-dep marker, the ansible collection and the bbot config; drop the
     # tool cache (~1.5 GB of a second chrome/node/jadx/trufflehog) and run leftovers.
@@ -182,6 +182,23 @@ RUN set -eux; \
     nuclei -version >/dev/null; httpx -version; subfinder -version; katana -version; \
     ffuf -V >/dev/null; dalfox --version >/dev/null 2>&1 || true; sqlmap --version >/dev/null
 
+# ------------------------------------------------------------------ wpscan ---
+# WordPress enumeration, with its metadata DB baked so `wpscan --url` works with no
+# egress and no `--update`. The CLI is installed system-wide; the API token is NOT
+# baked into any layer. /usr/local/bin/wpscan is a thin wrapper that injects
+# --api-token from $WPSCAN_API_TOKEN at exec time, so the token never appears in a
+# command line, a task prompt, an activity row, or a model context window.
+ARG WPSCAN_VERSION=3.8.28
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ruby ruby-dev build-essential \
+      libcurl4-openssl-dev libxml2-dev libxslt1-dev zlib1g-dev; \
+    gem install wpscan -v "$WPSCAN_VERSION" --no-document; \
+    apt-get purge -y --auto-remove ruby-dev build-essential \
+      libcurl4-openssl-dev libxml2-dev libxslt1-dev zlib1g-dev; \
+    rm -rf /var/lib/apt/lists/* /root/.gem; \
+    wpscan --version | grep -i "current version"
+
 # bbot recursive recon orchestrator (#117): blacklanternsecurity/bbot, AGPL-3.0
 # (same license as ARTEX; standalone CLI dependency, not linked code). Own venv to
 # isolate it from the image python, installed from a fully hashed lock
@@ -262,6 +279,36 @@ RUN set -eux; \
     count="$(find /home/artex/nuclei-templates -name "*.yaml" | wc -l)"; \
     echo "baked nuclei templates: $count"; \
     test "$count" -gt 10000
+# ------------------------------------------------- wpscan wrapper + metadata ---
+# Wrapper first: the gem binstub moves aside to wpscan.real and this reads the token
+# from the environment at exec time. `--api-token` present in the caller's argv wins,
+# so an explicit token is still possible.
+RUN set -eux; \
+    mv /usr/local/bin/wpscan /usr/local/bin/wpscan.real; \
+    printf '%s\n' \
+      '#!/bin/sh' \
+      '# Inject the WPScan API token without putting it on the command line.' \
+      'case " $* " in' \
+      '  *" --api-token "*) exec /usr/local/bin/wpscan.real "$@" ;;' \
+      'esac' \
+      'if [ -n "${WPSCAN_API_TOKEN:-}" ]; then' \
+      '  exec /usr/local/bin/wpscan.real --api-token "$WPSCAN_API_TOKEN" "$@"' \
+      'fi' \
+      'exec /usr/local/bin/wpscan.real "$@"' \
+      > /usr/local/bin/wpscan; \
+    chmod 0755 /usr/local/bin/wpscan; \
+    /usr/local/bin/wpscan --version | grep -i "current version"
+
+# Bake the metadata DB (plugins/themes/core/wordlists) as the runtime user. Without
+# it wpscan only has heuristic detection, and `--update` needs egress that a scoped
+# engagement does not have.
+RUN set -eux; \
+    HOME=/home/artex wpscan --update --no-banner >/dev/null 2>&1 || \
+      HOME=/home/artex wpscan --update --no-banner; \
+    test -d /home/artex/.wpscan/db; \
+    chown -R artex:artex /home/artex/.wpscan; \
+    find /home/artex/.wpscan/db -type f | wc -l
+
 COPY skills/ /app/skills/
 VOLUME ["/app/data", "/app/keys"]
 EXPOSE 8787 8788
