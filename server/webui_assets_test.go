@@ -14,7 +14,7 @@ import (
 func webuiTestFS() fstest.MapFS {
 	return fstest.MapFS{
 		"_next/static/chunks/app.js": {Data: bytes.Repeat([]byte("const a=1;\n"), 400)},
-		"index.html":                  {Data: []byte("<html><body>hi</body></html>")},
+		"index.html":                 {Data: []byte("<html><body>hi</body></html>")},
 	}
 }
 
