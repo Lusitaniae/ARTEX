@@ -88,6 +88,11 @@ func scanNotificationChannel(sc interface{ Scan(...any) error }) (*NotificationC
 	if err := sc.Scan(&c.ID, &c.Name, &c.Kind, &enabled, &c.Config, &c.Mode, &c.Filter, &c.RatePerMin, &c.CreatedAt, &c.UpdatedAt); err != nil {
 		return nil, err
 	}
+	cfg, err := openSecret(colNotifConfig, string(c.Config))
+	if err != nil {
+		return nil, err
+	}
+	c.Config = json.RawMessage(cfg)
 	c.Enabled = &enabled
 	return &c, nil
 }
@@ -152,19 +157,23 @@ func (d *DB) SaveNotificationChannel(ctx context.Context, c *NotificationChannel
 	if c.Filter == nil {
 		c.Filter = json.RawMessage(`{}`)
 	}
+	cfg, err := sealSecret(colNotifConfig, string(c.Config))
+	if err != nil {
+		return 0, err
+	}
 	enabled := c.IsEnabled()
 
 	if c.ID == 0 {
 		var id int64
 		err := d.QueryRowContext(ctx, `INSERT INTO notification_channels(name,kind,enabled,config,mode,filter,rate_per_min)
 VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id`,
-			c.Name, c.Kind, enabled, string(c.Config), c.Mode, string(c.Filter), c.RatePerMin).Scan(&id)
+			c.Name, c.Kind, enabled, string(cfg), c.Mode, string(c.Filter), c.RatePerMin).Scan(&id)
 		return id, err
 	}
 	res, err := d.ExecContext(ctx, `UPDATE notification_channels
 SET name=$2, kind=$3, enabled=$4, config=$5, mode=$6, filter=$7, rate_per_min=$8
 WHERE id=$1`,
-		c.ID, c.Name, c.Kind, enabled, string(c.Config), c.Mode, string(c.Filter), c.RatePerMin)
+		c.ID, c.Name, c.Kind, enabled, string(cfg), c.Mode, string(c.Filter), c.RatePerMin)
 	if err != nil {
 		return 0, err
 	}
@@ -393,6 +402,11 @@ FROM notification_channels WHERE enabled ORDER BY id`)
 		if err := rows.Scan(&c.ID, &c.Name, &c.Kind, &c.Config, &c.Mode, &c.Filter, &c.RatePerMin); err != nil {
 			return nil, err
 		}
+		cfg, err := openSecret(colNotifConfig, string(c.Config))
+		if err != nil {
+			return nil, err
+		}
+		c.Config = json.RawMessage(cfg)
 		out = append(out, &c)
 	}
 	return out, rows.Err()
@@ -495,6 +509,38 @@ func (d *DB) SetFindingStatusWithNotify(ctx context.Context, id int64, status st
 	return from, found, notified, err
 }
 
+// FindingStatusBatchResult is one id's outcome in a bulk status update.
+type FindingStatusBatchResult struct {
+	ID       int64  `json:"id"`
+	From     string `json:"from,omitempty"`
+	Found    bool   `json:"found"`
+	Changed  bool   `json:"changed"`
+	Notified bool   `json:"notified"`
+}
+
+// SetFindingStatusesWithNotify updates several findings to the same status in one
+// transaction. It returns a result per id, so an unknown id is reported as
+// found=false instead of hiding the others; a database error rolls the whole
+// batch back. Notification semantics stay identical to the single-row path: one
+// delivery event per finding whose status actually changed, none for a no-op.
+func (d *DB) SetFindingStatusesWithNotify(ctx context.Context, ids []int64, status string) ([]FindingStatusBatchResult, error) {
+	out := make([]FindingStatusBatchResult, 0, len(ids))
+	err := d.WithEvidenceTx(ctx, func(tx *sql.Tx) error {
+		for _, id := range ids {
+			from, found, changed, notified, err := SetFindingStatusTx(ctx, tx, id, status)
+			if err != nil {
+				return err
+			}
+			out = append(out, FindingStatusBatchResult{ID: id, From: from, Found: found, Changed: changed, Notified: notified})
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // SetFindingStatusTx updates a finding's status and registers a status-change delivery
 // event inside the **caller's transaction**.
 //
@@ -511,12 +557,12 @@ func (d *DB) SetFindingStatusWithNotify(ctx context.Context, id int64, status st
 func SetFindingStatusTx(ctx context.Context, tx *sql.Tx, id int64, status string) (from string, found bool, changed bool, notified bool, err error) {
 	var (
 		vulnclass, name, severity, summary string
-		taskID                             sql.NullInt64
+		taskID, nodeID                     sql.NullInt64
 		assetIDs                           []byte
 	)
-	scanErr := tx.QueryRowContext(ctx, `SELECT vulnclass, name, severity, summary, task_id, asset_ids, status
+	scanErr := tx.QueryRowContext(ctx, `SELECT vulnclass, name, severity, summary, task_id, asset_ids, status, node_id
 FROM findings WHERE id=$1 FOR UPDATE`, id).
-		Scan(&vulnclass, &name, &severity, &summary, &taskID, &assetIDs, &from)
+		Scan(&vulnclass, &name, &severity, &summary, &taskID, &assetIDs, &from, &nodeID)
 	if scanErr == sql.ErrNoRows {
 		return "", false, false, false, nil
 	}
@@ -531,6 +577,13 @@ FROM findings WHERE id=$1 FOR UPDATE`, id).
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE findings SET status=$2 WHERE id=$1`, id, status); err != nil {
 		return from, true, false, false, err
+	}
+	if nodeID.Valid {
+		if _, err := tx.ExecContext(ctx, `UPDATE exploration_nodes
+			SET payload = jsonb_set(payload, '{status}', to_jsonb($1::text))
+			WHERE id = $2`, status, nodeID.Int64); err != nil {
+			return from, true, false, false, err
+		}
 	}
 	var assets []int64
 	_ = json.Unmarshal(assetIDs, &assets)

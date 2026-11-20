@@ -32,6 +32,7 @@ export interface Task {
   tokens?: TokenTotal; // whole-task token consumption
   llm_profile_id?: number; // LLM profile used; absent = default profile
   llm_profile_ids?: number[]; // ordered task-level failover chain
+  llm_rotate?: boolean;
   active_llm_profile_id?: number; // profile used by the next LLM call
   llm_failover_state?: "default" | "ready" | "chain_exhausted" | string;
   llm_failover_reason?: string;
@@ -350,7 +351,7 @@ export interface WorkspaceFile {
   content?: string;
 }
 
-// One row of a task's test scope (coverage denominator + authorization boundary).
+// One row of a task's test scope (coverage denominator; coverage scope, not enforced).
 export interface TaskScopeRow {
   id: number;
   task_id: number;
@@ -481,6 +482,13 @@ export type FindingStatus =
   | "duplicate"
   | "risk_accepted";
 
+// Verification status (S1): the automated proof-of-exploitation outcome, distinct from the
+// human triage status above. "blocked" is produced by no path yet but is displayed when present.
+export type VerificationStatus = "verified" | "unverified" | "blocked" | "not_assessed" | "false_positive";
+
+// Report stage after triage: a finding can be confirmed and submitted at the same time.
+export type FindingReportState = "none" | "submitted" | "accepted" | "rejected" | "duplicate";
+
 // FindingAsset is an asset bound to a vulnerability (label pre-rendered by the backend).
 export interface FindingAsset {
   id: string;
@@ -493,12 +501,18 @@ export interface Finding {
   evidence_version?: number;
   report_evidence_version?: number;
   report_stale?: boolean;
+  poe_level?: number; // proof-of-exploitation level (3 or 4 when verified); 0 = none declared
+  verification_status?: VerificationStatus; // automated verification outcome (S1)
+  verification_note?: string; // why the status was reached; empty when verified
+  counterevidence?: string; // what was tested and did not work; optional, omitted when empty
+  confidence_rationale?: string; // why the conclusion holds; optional, omitted when empty
   id: string;
   finding_id?: string; // row id in the standalone findings table, the handle for status updates (may be missing for old in-task nodes)
   vulnclass: string;
   name?: string; // vulnerability name; display falls back to vulnclass when empty
   severity: Severity;
   status: FindingStatus;
+  report_state?: FindingReportState; // workflow stage after triage; default none
   summary: string;
   evidence: string;
   report?: string; // detailed report (Markdown); returned only by the detail endpoint, empty in lists
@@ -552,6 +566,8 @@ export interface FindingDeepenResponse {
 export interface FindingStats {
   total: number;
   pending: number;
+  submitted: number;
+  accepted: number;
   critical: number;
   high: number;
   medium: number;
@@ -575,6 +591,8 @@ export interface FindingQuery {
   pageSize: number;
   severity?: "all" | Severity;
   status?: "all" | FindingStatus;
+  reportState?: "all" | FindingReportState;
+  verificationStatus?: "all" | VerificationStatus;
   vulnclass?: string;
   task?: string; // task id; "all"/empty = no task filter
   query?: string;
@@ -885,6 +903,15 @@ export interface TrafficExchange {
   status: number;
   content_type: string;
   resp_len: number;
+  rewritten?: boolean;
+}
+
+export interface TrafficRewriteStats {
+  large_responses: number;
+  capacity_refusals: number;
+  tombstone_drops: number;
+  conversions: number;
+  sweeps: number;
 }
 
 export interface TrafficResp {
@@ -895,12 +922,67 @@ export interface TrafficResp {
   page?: number;
   size?: number;
   exchanges?: TrafficExchange[];
+  rewrite?: TrafficRewriteStats;
 }
 
 // Full raw request/response of one exchange (lazy-loaded on row select).
 export interface TrafficDetail {
   req: string;
   resp: string;
+  // WebSocket/SSE exchanges carry their messages separately (trafficStream);
+  // stream_kind is "" for an ordinary exchange.
+  stream_count?: number;
+  stream_kind?: "websocket" | "sse" | "";
+}
+
+// One recorded WebSocket message or SSE event. ts is in Unix seconds; seq
+// orders. payload is a preview of at most 4 KiB (base64 when encoding is
+// "base64"); blob names the full payload when it was stored separately.
+export interface TrafficStreamMessage {
+  seq: number;
+  ts: number;
+  direction: "c2s" | "s2c" | "meta" | (string & {});
+  kind: number;
+  type: "text" | "binary" | "event" | "meta" | (string & {});
+  event?: string;
+  event_id?: string;
+  retry?: number;
+  size: number;
+  payload: string;
+  encoding?: string;
+  blob?: string;
+  truncated?: boolean;
+}
+
+export interface TrafficStreamPage {
+  items: TrafficStreamMessage[];
+  total: number;
+}
+
+export interface TrafficReplayHeader {
+  name: string;
+  value: string;
+}
+
+// POST /api/traffic/replay. Host is not sent: the server takes it from url.
+// apply_rules defaults to false (bypasses capture rewrite rules).
+export interface TrafficReplayRequest {
+  method: string;
+  url: string;
+  headers: TrafficReplayHeader[];
+  body: string;
+  body_base64: boolean;
+  apply_rules?: boolean;
+}
+
+export interface TrafficReplayResult {
+  status: number;
+  headers: TrafficReplayHeader[];
+  raw: string;
+  duration_ms: number;
+  truncated: boolean;
+  // false when the host is in passthrough: the response was not recorded.
+  recorded: boolean;
 }
 
 // One distinct recorded host with its exchange count (target picker).
@@ -914,15 +996,17 @@ export interface Settings {
   traffic_capture: boolean;
   agent_traffic_binding: boolean; // agents auto-bind traffic evidence, off by default; does not affect manual binding
   llm_record: boolean; // LLM recording switch (off by default); when off no LLM calls are recorded
-  // Web search. brave_key_set / tavily_key_set reflect whether a key is stored
+  // Web search. brave_key_set / tavily_key_set / keenable_key_set reflect whether a key is stored
   // (the values are never returned). On PUT, send the corresponding field to set/clear.
   web_search_enabled: boolean;
-  web_search_backend: string; // "ddgs" | "brave-free" | "tavily" | "deepseek"
+  web_search_backend: string; // "ddgs" | "brave-free" | "tavily" | "keenable" | "deepseek"
   brave_key_set: boolean;
   tavily_key_set: boolean;
+  keenable_key_set: boolean;
   // write-only: only sent on PUT to store/clear the key.
   brave_search_api_key?: string;
   tavily_search_api_key?: string;
+  keenable_search_api_key?: string;
   // Dedicated egress proxy (http/https/socks5) for reaching search endpoints; unrelated to the MITM proxy that records traffic. Empty = direct.
   web_search_proxy?: string;
   // Global egress proxy (http/https/socks5, may carry user:pass) that all target traffic goes
@@ -949,6 +1033,26 @@ export interface Settings {
   notify_enabled?: boolean; // master push switch, on by default; one-click kill switch for maintenance windows
   notify_public_base_url?: string; // external base URL for vulnerability detail links; empty = messages carry no link
   notify_digest_interval_min?: number; // digest mode period (minutes), default 30
+  // Render limits of IM messages; 0 = no truncation. The backend answers 400 outside the bounds.
+  notify_summary_max_runes?: number; // summary characters per finding, 0-4000, default 120
+  notify_assets_max_shown?: number; // asset names listed per finding, 0-50, default 3
+  // Target noise profile; the stored setting wins over ARTEX_NOISE_PROFILE. Applies to the next request.
+  noise_profile?: NoiseProfileName;
+}
+
+export type NoiseProfileName = "off" | "quiet" | "balanced" | "aggressive";
+
+// GET /api/settings/noise: the current profile and its per-host counters (current minute, no reset).
+export interface NoiseStatus {
+  profile: NoiseProfileName;
+  hosts: {
+    host: string;
+    rpm: number;
+    peak_rpm: number;
+    peak_inflight: number;
+    inflight: number;
+    duplicates_avoided: number;
+  }[];
 }
 
 // ---- Vulnerability IM push ----
@@ -1061,6 +1165,8 @@ export interface LLMProfile {
   // Custom session header name: when non-empty every request carries this HTTP header, value = the current session/intent session id.
   // "" = not sent. For gateways that do prompt caching/sticky routing on a session-id header.
   session_header_key?: string;
+  // Custom User-Agent: when non-empty, every outbound LLM request overrides its User-Agent header with this value. "" = do not override (keep the default UA).
+  user_agent?: string;
   // This profile's retry overrides (connect / empty response / same-provider safety window). Empty / all zeros = follow the global policy.
   retry?: LLMRetryOverride;
 }
@@ -1263,7 +1369,8 @@ export interface Stats {
 // ---- Intercept Rules ----
 export type InterceptAction = "allow" | "deny" | "ask";
 export type InterceptMatchTarget = "tool_name" | "tool_input";
-export type InterceptMatchType = "string" | "regex";
+// argv: pattern is a JSON array of tokens, the prefix of a Bash command (program and subcommands; flags are not constrained).
+export type InterceptMatchType = "string" | "regex" | "argv";
 
 export interface InterceptRule {
   id: number;
@@ -1337,6 +1444,9 @@ export interface AssetInterceptRule {
 
 export interface InterceptPending {
   decision_source?: "rule" | "model" | "unknown" | "";
+  // Actor that settled the request, exactly as stored: "" while pending and on
+  // rows decided before the column existed (shown as "Legacy").
+  decided_by?: "human" | "rule" | "model" | "system" | "";
   id: number;
   rule_id?: number;
   conversation_id?: number;
@@ -1349,11 +1459,26 @@ export interface InterceptPending {
   reason: string; // the rule's message or the model's verdict reason (model verdicts carry a [model] prefix)
   decided_at?: string;
   created_at: string;
+  // Deterministic risk score, computed by the server when a pending row is read.
+  risk?: InterceptRisk;
+}
+
+export interface InterceptRisk {
+  score: number; // 0..100
+  level: "low" | "medium" | "high";
+  reasons: string[];
+}
+
+export interface InterceptBatchDecideResult {
+  decided: number;
+  failed: number;
+  results: { id: number; ok: boolean; error?: string }[];
 }
 
 // JudgeConfig: global config for model fallback approval (the model decides only when no interception rule matches).
 export interface JudgeConfig {
   enabled: boolean;
+  mode?: "closed" | "freeform"; // closed (default): fixed questions, code decides; freeform: the prompt decides
   profile_id: number; // 0 = follow the active/default profile
   prompt: string; // verdict prompt; on GET the backend backfills the full built-in template when unset
   timeout_seconds: number; // model call timeout
@@ -1381,6 +1506,7 @@ export interface JudgeUsage {
 export interface InterceptApprovalFilter {
   status?: InterceptPending["status"];
   decision_source?: "rule" | "model" | "unknown";
+  decided_by?: "human" | "rule" | "model" | "system";
 }
 
 // InterceptApprovalRow enriches InterceptPending with conversation/task and rule context.
@@ -1531,6 +1657,7 @@ export interface InterceptAudit {
   rule_name?: string;
   config_digest?: string;
   profile_id?: number;
+  judge_answers?: { id: string; answer: "yes" | "no" | "unknown"; evidence: string }[];
   execution_status: "not_started" | "not_executed" | "awaiting_result" | "succeeded" | "failed" | "unknown";
   output?: string;
   output_truncated?: boolean;
@@ -1538,6 +1665,7 @@ export interface InterceptAudit {
 }
 export interface InterceptDetail extends InterceptApprovalRow {
   audit: InterceptAudit | null;
+  always_allow_prefix?: string; // pending Bash request: the argv prefix "always allow" would allow
 }
 
 export type TrafficEvidenceRole = "baseline" | "proof" | "verification" | "supporting";
@@ -1560,6 +1688,8 @@ export interface TrafficEvidenceSnapshot {
   resp_hash: string;
   req_len: number;
   resp_len: number;
+  rewritten?: boolean;
+  rewrite_rule_ids?: number[];
 }
 export interface FindingTrafficBinding {
   id: string;

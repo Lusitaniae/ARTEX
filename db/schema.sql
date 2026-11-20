@@ -201,6 +201,13 @@ ALTER TABLE exploration_nodes ADD COLUMN IF NOT EXISTS delete_reason TEXT;
 -- a node most recently went from "has a live downstream branch" to none (NULL = hot).
 ALTER TABLE exploration_nodes ADD COLUMN IF NOT EXISTS content_version  INT    NOT NULL DEFAULT 0;
 ALTER TABLE exploration_nodes ADD COLUMN IF NOT EXISTS cold_since_round BIGINT;
+-- Intent claim lease: unclaim_token is the fencing token of the current claim (fresh
+-- per claim, cleared when the claim is settled or taken over); last_heartbeat_at is
+-- the claimer's latest heartbeat. A running intent whose heartbeat is older than
+-- db.IntentClaimTTL may be taken over. Both are NULL on rows claimed before these
+-- columns existed, which counts as expired.
+ALTER TABLE exploration_nodes ADD COLUMN IF NOT EXISTS last_heartbeat_at TIMESTAMPTZ;
+ALTER TABLE exploration_nodes ADD COLUMN IF NOT EXISTS unclaim_token     TEXT;
 -- ck_node_kind: existing installs predate the 'digest' kind — recreate to allow it.
 DO $$
 BEGIN
@@ -396,6 +403,8 @@ CREATE TABLE IF NOT EXISTS llm_profiles (
     -- Custom session header: when non-empty, every request carries an HTTP header of this name whose value is the current session id
     -- (chat session/worker intent). For gateways that do prompt caching/sticky routing by a session-id header. ''=do not send.
     session_header_key TEXT NOT NULL DEFAULT '',
+    -- Custom User-Agent: when non-empty, every outbound LLM request overrides the User-Agent header with this value. ''=do not override (keep the default UA).
+    user_agent       TEXT NOT NULL DEFAULT '',
     -- Retry overrides: attempts 0=use global default / -1=disable / >0=use this value; interval 0=use default exponential backoff / >0=fixed milliseconds.
     -- The three groups correspond to connect retry, empty-response retry, and same-provider safe-window retry; see the ALTER comment below.
     retry_connect_attempts    INTEGER NOT NULL DEFAULT 0,
@@ -436,6 +445,8 @@ ALTER TABLE llm_profiles ADD  CONSTRAINT llm_profiles_max_tokens_check
     CHECK (max_tokens >= 0);
 -- Custom session header name; backfills old databases. Default '' = do not send; old configs behave unchanged.
 ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS session_header_key TEXT NOT NULL DEFAULT '';
+-- Custom User-Agent; backfills old databases. Default '' = do not override (keep the default UA); old configs behave unchanged.
+ALTER TABLE llm_profiles ADD COLUMN IF NOT EXISTS user_agent TEXT NOT NULL DEFAULT '';
 
 -- Per-profile retry overrides (see the LLM retry design doc). Each of the three groups is a pair of
 -- "attempts + fixed interval" with unified semantics: attempts 0=use the global default, -1=disable this layer's
@@ -547,6 +558,8 @@ CREATE TRIGGER trg_tasks_upd BEFORE UPDATE ON tasks
 -- planner heartbeat trigger interval (seconds); backfills old databases. Default 300s (5min). See docs/planner-trigger-impl-plan.md
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS plan_heartbeat_seconds INTEGER NOT NULL DEFAULT 300;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS plan_quiet_mode BOOLEAN NOT NULL DEFAULT true;
+-- Approval gate for asset targets, opt-in per task; backfills old databases. false (default) = no gate, behaviour unchanged.
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS target_gate BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS llm_rotate BOOLEAN NOT NULL DEFAULT false;
 -- Concurrency-limit hold state; backfills old databases. true=queued due to the concurrency limit, auto-starts when a slot frees up.
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS queued BOOLEAN NOT NULL DEFAULT false;
@@ -741,12 +754,13 @@ WHERE t.active_llm_profile_id IS NULL
   AND t.llm_profile_id IS NOT NULL
   AND EXISTS (SELECT 1 FROM task_llm_profiles x WHERE x.task_id=t.id AND x.profile_id=t.llm_profile_id);
 
--- Task test scope (the asset-coverage denominator + authorization boundary).
+-- Task test scope (the asset-coverage denominator; coverage scope, not enforced).
 --   Auto-filled (source='auto'): insertAssets' top level adds a conservative scope per asset type explicitly
 --     inserted by the worker (root_domain→root_domain, subdomain/service/endpoint→subdomain(host), ip→ip);
 --     side-effect-derived assets do not enter the scope (the hook sits at the handler top level; derivation is internal to the db layer).
 --   Agent-filled (source='agent'): add_task_scope adds company/root_domain/subdomain/ip.
 -- Coverage = among assets matching active rows (denominator), the share anchored by fact nodes (numerator).
+-- An auto row is active only under a declared (non-auto) domain or IP root of the same task (declaredScopeFilter in task_scope.go).
 CREATE TABLE IF NOT EXISTS task_scope (
     id          BIGSERIAL PRIMARY KEY,
     task_id     BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -984,6 +998,8 @@ CREATE TABLE IF NOT EXISTS conversations (
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS pinned_at TIMESTAMPTZ;
+-- Approval gate for asset targets, opt-in per conversation (a chat has no task). false (default) = no gate.
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS target_gate BOOLEAN NOT NULL DEFAULT false;
 CREATE INDEX IF NOT EXISTS idx_conversations_llm_profile ON conversations(llm_profile_id) WHERE llm_profile_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_conversations_pinned ON conversations(pinned_at DESC) WHERE pinned_at IS NOT NULL;
 DROP TRIGGER IF EXISTS trg_conversations_upd ON conversations;
@@ -1060,7 +1076,7 @@ CREATE TABLE IF NOT EXISTS intercept_rules (
     enabled         BOOLEAN NOT NULL DEFAULT true,
     priority        INTEGER NOT NULL DEFAULT 0,
     match_target    TEXT NOT NULL CHECK (match_target IN ('tool_name', 'tool_input')),
-    match_type      TEXT NOT NULL CHECK (match_type IN ('string', 'regex')),
+    match_type      TEXT NOT NULL CHECK (match_type IN ('string', 'regex', 'argv')),
     pattern         TEXT NOT NULL,
     action          TEXT NOT NULL CHECK (action IN ('allow', 'deny', 'ask')),
     message         TEXT NOT NULL DEFAULT '',
@@ -1070,6 +1086,10 @@ CREATE TABLE IF NOT EXISTS intercept_rules (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+-- Allow argv prefix rules on databases created before them (pattern = JSON array of tokens).
+ALTER TABLE intercept_rules DROP CONSTRAINT IF EXISTS intercept_rules_match_type_check;
+ALTER TABLE intercept_rules ADD CONSTRAINT intercept_rules_match_type_check
+    CHECK (match_type IN ('string','regex','argv'));
 DROP TRIGGER IF EXISTS trg_intercept_rules_upd ON intercept_rules;
 CREATE TRIGGER trg_intercept_rules_upd BEFORE UPDATE ON intercept_rules
     FOR EACH ROW EXECUTE FUNCTION set_updated_at();
@@ -1084,7 +1104,7 @@ CREATE TABLE IF NOT EXISTS intercept_pending (
     tool_input      JSONB NOT NULL DEFAULT '{}',
     status          TEXT NOT NULL DEFAULT 'pending'
                         CHECK (status IN ('pending', 'allowed', 'denied', 'timeout')),
-    -- Decision reason: the rule message when a rule hits; the model's short reason (with the [Model] prefix) for an LLM fallback decision.
+    -- Decision reason: the rule message when a rule hits; the model's short reason (with the [model] prefix) for an LLM fallback decision.
     reason          TEXT NOT NULL DEFAULT '',
     decided_at      TIMESTAMPTZ,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -1098,6 +1118,65 @@ ALTER TABLE intercept_pending ADD COLUMN IF NOT EXISTS audit JSONB;
 ALTER TABLE intercept_pending ADD COLUMN IF NOT EXISTS decision_source TEXT NOT NULL DEFAULT '';
 UPDATE intercept_pending SET decision_source=CASE WHEN rule_id IS NOT NULL THEN 'rule'
  WHEN reason LIKE '[Model]%' THEN 'model' ELSE 'unknown' END WHERE decision_source='';
+-- Judge decisions were stored as 'unknown' because the readers expected a capitalized
+-- prefix while the judge wrote '[model]' (and '[模型]' before e233c02). Idempotent:
+-- once corrected no row matches the WHERE clause again.
+UPDATE intercept_pending SET decision_source='model'
+ WHERE decision_source='unknown' AND rule_id IS NULL
+   AND (reason LIKE '[model]%' OR reason LIKE '[模型]%');
+-- Actor that settled the request: '' (pending, or decided before this column
+-- existed) | human | rule | model | system. No backfill: readers fall back to
+-- decision_source for legacy rows instead of rewriting history.
+ALTER TABLE intercept_pending ADD COLUMN IF NOT EXISTS decided_by TEXT NOT NULL DEFAULT '';
+-- Target approval requests. target_key = '<host>:<port>' of the asset target the row asks for;
+-- NULL = classic ask (and every row that predates the column). At most one open request per
+-- scope (task or conversation) and target: concurrent calls to one host share one row.
+ALTER TABLE intercept_pending ADD COLUMN IF NOT EXISTS target_key TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_intercept_pending_target
+    ON intercept_pending (COALESCE(task_id,''), COALESCE(conversation_id,0), target_key)
+    WHERE status = 'pending' AND target_key IS NOT NULL;
+
+-- Target pins: host + port approved by a human for one task or one conversation, with the
+-- addresses shown at approval time. Written only by the decide endpoint. No foreign keys on
+-- task_id, conversation_id and intercept_id: a pin outlives its task, its conversation and its
+-- request row as history (revoked, never deleted). status and revoked_reason carry no CHECK
+-- (validated in Go, same convention as findings.status).
+CREATE TABLE IF NOT EXISTS target_pins (
+    id              BIGSERIAL PRIMARY KEY,
+    task_id         BIGINT,
+    conversation_id BIGINT,
+    host            TEXT NOT NULL,                  -- normalised name, IP literal or CIDR
+    port            INTEGER NOT NULL DEFAULT 0,     -- 0 = port not declared: covers every port of the host
+    version         INTEGER NOT NULL DEFAULT 1,
+    pinned_ips      TEXT[] NOT NULL DEFAULT '{}',   -- canonical, sorted
+    resolver        TEXT NOT NULL DEFAULT '',
+    resolved_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    status          TEXT NOT NULL DEFAULT 'active', -- active | superseded | revoked
+    intercept_id    BIGINT,                         -- the request row that carried the click
+    decided_by      TEXT NOT NULL DEFAULT '',       -- approver: subject of the session token
+    decided_from    TEXT NOT NULL DEFAULT '',       -- remote address of the click
+    -- Approved while the upstream egress proxy was set: the proxy chooses the address, so the
+    -- pin covers the name only and its addresses are not compared. Stays true if the proxy is
+    -- removed later; enforcing addresses again takes a new approval.
+    name_only_effective BOOLEAN NOT NULL DEFAULT false,
+    revoked_at      TIMESTAMPTZ,
+    revoked_reason  TEXT NOT NULL DEFAULT '',       -- operator | task_deleted | conversation_deleted
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_target_pins_active
+    ON target_pins (COALESCE(task_id,0), COALESCE(conversation_id,0), host, port)
+    WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_target_pins_scope ON target_pins (task_id, conversation_id, status);
+
+-- Append-only history of the target-gate exemption list (settings key target_gate_exempt_hosts).
+CREATE TABLE IF NOT EXISTS target_gate_exemption_log (
+    id          BIGSERIAL PRIMARY KEY,
+    changed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    changed_by  TEXT NOT NULL DEFAULT '',
+    before      JSONB,
+    after       JSONB,
+    digest      TEXT NOT NULL DEFAULT ''
+);
 
 -- =====================================================================
 -- L. Finding persistence
@@ -1167,6 +1246,21 @@ CREATE TRIGGER trg_conversation_retest_delete BEFORE DELETE ON conversations
 
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS evidence_version BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE findings ADD COLUMN IF NOT EXISTS report_evidence_version BIGINT NOT NULL DEFAULT 0;
+-- Machine-checked proof state (S1). Separate from status (human disposition). Existing rows stay
+-- unverified / POE 0: history is never auto-verified. Values validated server-side, no CHECK.
+-- verification_status: verified / unverified / blocked / not_assessed / false_positive.
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS poe_level SMALLINT NOT NULL DEFAULT 0;
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS verification_status TEXT NOT NULL DEFAULT 'unverified';
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS verification_note TEXT NOT NULL DEFAULT '';
+-- Reporter-supplied reasoning, both optional (empty = not given): counterevidence is what was
+-- tested and did not work; confidence_rationale is why the conclusion holds.
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS counterevidence TEXT NOT NULL DEFAULT '';
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS confidence_rationale TEXT NOT NULL DEFAULT '';
+-- Report stage after triage (none / submitted / accepted / rejected / duplicate).
+-- Separate from status so a finding can be confirmed and submitted at once; RSI
+-- lessons still read status. Server whitelist, no CHECK (same as status).
+ALTER TABLE findings ADD COLUMN IF NOT EXISTS report_state TEXT NOT NULL DEFAULT 'none';
+CREATE INDEX IF NOT EXISTS idx_findings_report_state ON findings (report_state, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS traffic_evidence_snapshots (
     id TEXT PRIMARY KEY,
@@ -1350,7 +1444,7 @@ CREATE TABLE IF NOT EXISTS notification_channels (
     -- dingtalk DingTalk / feishu Feishu (Lark) / wecom WeCom (WeChat Work) / webhook generic / telegram / email
     kind         TEXT NOT NULL,
     enabled      BOOLEAN NOT NULL DEFAULT true,
-    -- Credentials (stored in plaintext, masked when echoed to the UI; see maskChannelSecrets on the server side).
+    -- Credentials (encrypted at rest by db/secrets.go, masked when echoed to the UI; see notify.MaskConfig).
     -- The six channel kinds differ wildly in fields, so one JSONB column + strict per-kind validation on the Go
     -- side avoids a pile of NULL columns per channel:
     --   dingtalk {webhook,secret}
@@ -1483,3 +1577,39 @@ CREATE TABLE IF NOT EXISTS rsi_lesson_usage (
     shown_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (lesson_id, task_id, mode)
 );
+
+-- Coverage ledger (agent_reported layer, see db/coverage_ledger.go): what a worker
+-- examined, ruled out or left open, per (task, surface, risk_area). One current row
+-- per key; every write is also appended to coverage_ledger_history. A risk class with
+-- no row is unexamined, never clean. Rows exist only for tasks with coverage_enabled.
+CREATE TABLE IF NOT EXISTS coverage_ledger (
+    id          BIGSERIAL PRIMARY KEY,
+    task_id     BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    surface     TEXT NOT NULL,
+    risk_area   TEXT NOT NULL,  -- stored lower-case, matched against goal vulnclass
+    outcome     TEXT NOT NULL
+                CHECK (outcome IN ('reported','no_issue_found','ruled_out','not_applicable','needs_follow_up')),
+    evidence    TEXT NOT NULL DEFAULT '',
+    reason      TEXT NOT NULL DEFAULT '',
+    worker      TEXT NOT NULL DEFAULT '',
+    intent_id   BIGINT,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (task_id, surface, risk_area)
+);
+CREATE TABLE IF NOT EXISTS coverage_ledger_history (
+    id          BIGSERIAL PRIMARY KEY,
+    task_id     BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    surface     TEXT NOT NULL,
+    risk_area   TEXT NOT NULL,
+    outcome     TEXT NOT NULL,
+    evidence    TEXT NOT NULL DEFAULT '',
+    reason      TEXT NOT NULL DEFAULT '',
+    worker      TEXT NOT NULL DEFAULT '',
+    intent_id   BIGINT,
+    recorded_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_coverage_ledger_history_task ON coverage_ledger_history(task_id, id);
+-- Why the current run ended ('' = normal, 'budget' = run-budget wrap-up). Per run:
+-- written with the guarded terminal status, cleared when the task moves back to a
+-- non-terminal state (revive), so an earlier run's reason never marks a later one.
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS end_reason TEXT NOT NULL DEFAULT '';

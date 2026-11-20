@@ -316,7 +316,7 @@ func (s *Server) restoreTaskArchivePayload(job *pgdb.TaskArchive, snapshot *pgdb
 		}
 	}
 	_ = s.m.pg.UpdateTaskArchiveProgress(job.ID, "restore_files", 55)
-	files, err := installTaskArchiveFiles(s.m.dir, extracted, strconv.FormatInt(job.TaskID, 10), job.ID)
+	files, err := installTaskArchiveFiles(s.m.dir, extracted, strconv.FormatInt(job.TaskID, 10), job.ID, s.execPriv)
 	if err != nil {
 		return err
 	}
@@ -512,7 +512,7 @@ func (s *Server) queueTaskArchiveDelete(w http.ResponseWriter, r *http.Request) 
 
 func (s *Server) queueTaskArchivesBatch(w http.ResponseWriter, r *http.Request) {
 	var request archiveBatchRequest
-	if err := decode(r, &request); err != nil {
+	if err := decode(w, r, &request); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -552,7 +552,7 @@ func (s *Server) queueTaskArchivesBatch(w http.ResponseWriter, r *http.Request) 
 
 func (s *Server) queueTaskArchiveActionBatch(w http.ResponseWriter, r *http.Request, action string) {
 	var request archiveBatchRequest
-	if err := decode(r, &request); err != nil {
+	if err := decode(w, r, &request); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}

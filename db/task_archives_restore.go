@@ -361,28 +361,40 @@ func rowExists(tx *sql.Tx, table string, id int64) bool {
 	return exists
 }
 
-func insertArchiveRows(tx *sql.Tx, table string, raw json.RawMessage) error {
-	// json_populate_recordset inserts NULL for absent columns, bypassing SQL
-	// defaults. Preserve compatibility with v3 archives predating side memory.
-	if (table == "side_question_sessions" || table == "side_question_requests") && len(raw) > 0 {
-		var rows []map[string]json.RawMessage
-		if err := json.Unmarshal(raw, &rows); err != nil {
-			return err
-		}
-		field := "memory"
-		if table == "side_question_requests" {
-			field = "context_info"
-		}
-		for _, row := range rows {
+// archiveDefaults are the columns that did not exist when older archives were
+// written. json_populate_recordset inserts NULL for an absent key, bypassing the
+// SQL default, and a NOT NULL column then rejects the whole restore.
+var archiveDefaults = map[string]map[string]string{
+	"side_question_sessions": {"memory": `{}`},
+	"side_question_requests": {"context_info": `{}`},
+	"findings":               {"report_state": `"none"`},
+}
+
+// fillArchiveDefaults restores the default of a column an older archive
+// predates, so a restore keeps working across schema additions.
+func fillArchiveDefaults(table string, raw json.RawMessage) (json.RawMessage, error) {
+	defaults, ok := archiveDefaults[table]
+	if !ok || len(raw) == 0 {
+		return raw, nil
+	}
+	var rows []map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &rows); err != nil {
+		return nil, err
+	}
+	for _, row := range rows {
+		for field, def := range defaults {
 			if len(row[field]) == 0 || string(row[field]) == "null" {
-				row[field] = json.RawMessage(`{}`)
+				row[field] = json.RawMessage(def)
 			}
 		}
-		var err error
-		raw, err = json.Marshal(rows)
-		if err != nil {
-			return err
-		}
+	}
+	return json.Marshal(rows)
+}
+
+func insertArchiveRows(tx *sql.Tx, table string, raw json.RawMessage) error {
+	raw, err := fillArchiveDefaults(table, raw)
+	if err != nil {
+		return err
 	}
 	allowed := map[string]bool{
 		"exploration_nodes": true, "exploration_edges": true, "exploration_anchors": true,
@@ -396,7 +408,7 @@ func insertArchiveRows(tx *sql.Tx, table string, raw json.RawMessage) error {
 	if rawRowCount(raw) == 0 {
 		return nil
 	}
-	_, err := tx.Exec(`INSERT INTO `+table+` SELECT * FROM json_populate_recordset(NULL::`+table+`,$1::json)`, string(raw))
+	_, err = tx.Exec(`INSERT INTO `+table+` SELECT * FROM json_populate_recordset(NULL::`+table+`,$1::json)`, string(raw))
 	return err
 }
 
@@ -446,6 +458,14 @@ func restoreArchiveAssets(tx *sql.Tx, taskID int64, raw json.RawMessage) (map[in
 			row["company_id"] = nil
 			row["company_source"] = "explicit"
 			warnings = append(warnings, fmt.Sprintf("asset %d's company %d has been deleted; restored as unaffiliated", oldID, companyID))
+		}
+		// Archives taken before normalizeURL stripped userinfo can hold
+		// http://user:pass@host URLs. Normalise like the live upserts so the
+		// restore neither stores the credential nor misses the clean row.
+		if typeName, _ := row["type"].(string); typeName == "service" || typeName == "endpoint" {
+			if rawURL, ok := row["url"].(string); ok {
+				row["url"] = normalizeURL(rawURL)
+			}
 		}
 		if existing, found, err := findArchiveAssetNaturalID(tx, row); err != nil {
 			return nil, nil, err
@@ -677,13 +697,18 @@ func restoreInterceptRows(tx *sql.Tx, raw json.RawMessage) error {
 			source = "unknown"
 			if row["rule_id"] != nil {
 				source = "rule"
-			} else if reason, _ := row["reason"].(string); strings.HasPrefix(reason, "[Model]") {
+			} else if reason, _ := row["reason"].(string); isModelReason(reason) {
 				source = "model"
 			}
 			row["decision_source"] = source
 		}
+		// Archives predating decided_by lack this NOT NULL column too.
+		if row["decided_by"] == nil {
+			row["decided_by"] = ""
+		}
 		if status, _ := row["status"].(string); status == "pending" {
 			row["status"] = "timeout"
+			row["decided_by"] = "system"
 			row["reason"] = "approval timed out while the task was archived"
 			row["decided_at"] = time.Now().UTC()
 			if audit, ok := row["audit"].(map[string]any); ok {
@@ -759,6 +784,13 @@ WHERE archive.id=$1 FOR UPDATE OF archive,task`, archiveID).Scan(&taskID, &expID
 		return fmt.Errorf("%w: task %d", ErrTaskArchiveDeleteBlocked, dependent)
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	// As in DeleteTaskCascadePrepared: pins stay as revoked history.
+	if err := revokeTaskPins(tx, taskID); err != nil {
+		return err
+	}
+	if err := settleTaskTargetRequests(tx, taskID); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`DELETE FROM tasks WHERE id=$1 AND archived_at IS NOT NULL`, taskID); err != nil {

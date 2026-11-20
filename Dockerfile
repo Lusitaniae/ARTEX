@@ -14,6 +14,9 @@
 # against a SHA-256 pinned in this file, sqlmap is pinned to a commit, npm globals
 # are pinned to exact versions, Node is copied from the pinned build stage instead
 # of piping a remote install script into bash, and the container runs unprivileged.
+# Upstream changes ported at the 2026-11-20 merge: bbot arm64 native chrome/node
+# (701a1c9), MCP chromium via its own playwright-core (5a4af1b), setuid/setgid
+# stripping (eb5d3d7), keys dir 0700 (04a7ab3).
 
 # ---------------------------------------------------------------- frontend ---
 # Pinned to the Node 22 line the CI/release workflows use. On the build platform
@@ -59,6 +62,7 @@ RUN ARTEX_SKIP_FRONTEND=1 \
 # runtime: they lived in /root, and the container runs as uid 10001.
 FROM python:3.12.16-slim-bookworm@sha256:935c3c5b12357a7e10caa9c1e6ca5692344d97cf229832ef584be2cec9fc03df AS bbotdeps
 ARG BBOT_VERSION=3.0.2
+ARG TARGETARCH
 
 # Prepare bbot under the *runtime* user's home, not root's. bbot records completed
 # core-dependency installs in ~/.bbot/cache/<hash> and skips the installer when the
@@ -79,9 +83,21 @@ RUN set -eux; \
     rm -f /tmp/requirements-bbot.lock; \
     ln -s /opt/bbot/bin/bbot /usr/local/bin/bbot; \
     PIP_NO_CACHE_DIR=1 bbot -y --install-all-deps; \
+    # arm64: gowitness downloads an x86-64 Chrome and retirejs an x86-64 Node, which
+    # cannot run there. Use Debian's chromium for gowitness and the arm64 Node for
+    # retirejs. Ported from upstream 701a1c9; amd64 is unchanged. \
+    if [ "${TARGETARCH:-amd64}" = "arm64" ]; then \
+      apt-get update; \
+      apt-get install -y --no-install-recommends chromium; \
+      rm -rf /var/lib/apt/lists/*; \
+      bbot_dir="$(/opt/bbot/bin/python -c 'import bbot, os; print(os.path.dirname(bbot.__file__))')"; \
+      sed -i 's/linux-x64/linux-arm64/g' "$bbot_dir/modules/retirejs.py"; \
+      mkdir -p "$HOME/.config/bbot"; \
+      printf '\nmodules:\n  gowitness:\n    chrome_path: /usr/bin/chromium\n' >> "$HOME/.config/bbot/bbot.yml"; \
+    fi; \
     bbot --version >/dev/null; \
-    bbot --dry-run -t example.com -m wafw00f,paramminer_getparams,lightfuzz,sslcert,gowitness >/dev/null 2>&1 || true; \
-    bbot --dry-run -t example.com -m wafw00f,paramminer_getparams,lightfuzz,sslcert,gowitness >/tmp/bbot-dry.log 2>&1 || true; \
+    bbot --dry-run -t example.com -m wafw00f,paramminer_getparams,lightfuzz,sslcert,gowitness,retirejs >/dev/null 2>&1 || true; \
+    bbot --dry-run -t example.com -m wafw00f,paramminer_getparams,lightfuzz,sslcert,gowitness,retirejs >/tmp/bbot-dry.log 2>&1 || true; \
     ! grep -qE "Installing|ERRR|CRITICAL" /tmp/bbot-dry.log || { cat /tmp/bbot-dry.log; exit 1; }; \
     # Keep the core-dep marker, the ansible collection and the bbot config; drop the
     # tool cache (~1.5 GB of a second chrome/node/jadx/trufflehog) and run leftovers.
@@ -231,6 +247,10 @@ RUN npm install -g --no-fund --no-audit \
     # headless Chromium runs the chromium-headless-shell build, so the ~420 MB headed
     # Chromium never starts. Drop it; ffmpeg stays (screenshots/video need it).
     && playwright install --with-deps --only-shell chromium \
+    # @playwright/mcp bundles its own playwright-core, which expects a different
+    # Chromium revision than the playwright package above installs; without this
+    # the browser MCP cannot launch (upstream 5a4af1b).
+    && "$(npm root -g)/@playwright/mcp/node_modules/.bin/playwright-core" install chromium \
     # --with-deps also pulls Xvfb and mesa for headed rendering: libgl1-mesa-dri
     # drags in libLLVM-15 (112 MB) plus 25 MB of dri drivers. Headless Chromium
     # renders through the bundled SwiftShader instead; verified that screenshots and
@@ -249,7 +269,8 @@ COPY --from=build /out/artex /app/artex
 COPY start.sh /app/start.sh
 COPY docker-entrypoint.sh /app/docker-entrypoint.sh
 RUN chmod +x /app/artex /app/start.sh /app/docker-entrypoint.sh \
-    && mkdir -p /app/keys /app/data
+    && mkdir -p /app/keys /app/data \
+    && chmod 0700 /app/keys
 
 # persistence points: data/ (SQLite, task files) and keys/ (jwt.key, via ARTEX_JWT_KEY_DIR)
 # Only the writable paths are handed to the runtime user; the binary and skills stay
@@ -259,6 +280,10 @@ RUN groupadd --gid 10001 artex \
                --shell /usr/sbin/nologin artex \
     && chown -R artex:artex /app/data /app/keys /home/artex \
     && chmod -R a+rX /ms-playwright
+# No setuid or setgid programs (su, passwd, mount, bbot's chrome_sandbox, ...): an
+# agent process runs as uid 10001 and must not regain root through one. Ported from
+# upstream eb5d3d7; complements cap_drop: ALL and no-new-privileges.
+RUN find / -xdev -perm /6000 -type f -exec chmod a-s {} +
 
 # ---------------------------------------------------------- nuclei templates ---
 # nuclei v3 installs its templates on first run. That is a silent failure whenever

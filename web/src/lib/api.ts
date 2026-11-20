@@ -3,6 +3,7 @@
 // a few fields the backend serializes differently (e.g. created_at as a unix int)
 // are passed through and formatted at the call site.
 
+import { t } from "@/i18n";
 import type { ChatMention } from "@/lib/chat-mentions";
 import { MOCK } from "@/lib/mock/enabled";
 import { mockHandle } from "@/lib/mock/handler";
@@ -43,6 +44,7 @@ import type {
   FindingGroupsPage,
   FindingQuery,
   FindingRetest,
+  FindingReportState,
   FindingStats,
   FindingStatus,
   FindingsPage,
@@ -101,15 +103,33 @@ import type {
   TrafficEvidenceRef,
   TrafficEvidenceRole,
   TrafficHost,
+  TrafficReplayRequest,
+  TrafficReplayResult,
   TrafficResp,
+  TrafficStreamPage,
   UsageStats,
   WorkspaceFile,
   WorkspaceListing,
 } from "@/lib/types";
 
+// Combined file data per attachment upload; matches maxChatUpload in server/chatupload.go.
+const MAX_CHAT_UPLOAD_BYTES = 512 * 1024 * 1024;
+
 function getToken(): string | null {
   if (typeof window === "undefined") return null;
   return localStorage.getItem("artex_token");
+}
+
+// ApiError is what http() throws for a non-2xx response: the message is the
+// server's {error} (or "METHOD path: status"), and status lets callers tell
+// failures apart.
+export class ApiError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+  }
 }
 
 export async function http<T>(path: string, init?: RequestInit): Promise<T> {
@@ -129,7 +149,7 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
       document.cookie = "artex_token=; path=/; max-age=0";
       window.location.href = "/login";
     }
-    throw new Error("Unauthorized");
+    throw new Error(t("Unauthorized"));
   }
   if (!r.ok) {
     const fallback = `${init?.method ?? "GET"} ${path}: ${r.status}`;
@@ -142,7 +162,7 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       // Keep the status-based fallback for empty or non-JSON error responses.
     }
-    throw new Error(message);
+    throw new ApiError(message, r.status);
   }
   if (r.status === 204) return undefined as T;
   return r.json();
@@ -163,7 +183,9 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
 // to the Go backend on :8787, whose CORS is open.
 //
 // Override either default with NEXT_PUBLIC_SSE_BASE (set it to "" to force same-origin).
-// Token is appended as ?token= because SSE can't carry cookies cross-origin.
+// A same-origin stream sends the artex_token cookie. The query token is added only
+// when base is non-empty, which is the dev connection to :8787: that origin cannot
+// send the cookie.
 // mockReport returns a canned Markdown report for the demo.
 function mockReport(_task?: string): string {
   return `# ARTEX Penetration Test Report — Acme Corp
@@ -193,6 +215,9 @@ export function sseUrl(path: string): string {
     (process.env.NODE_ENV !== "production" && typeof window !== "undefined"
       ? `${window.location.protocol}//${window.location.hostname}:8787`
       : "");
+  if (!base) {
+    return path;
+  }
   const token = getToken();
   const sep = path.includes("?") ? "&" : "?";
   return token ? `${base}${path}${sep}token=${encodeURIComponent(token)}` : `${base}${path}`;
@@ -218,6 +243,8 @@ function findingFilterParams(q: Omit<FindingQuery, "page" | "pageSize">): URLSea
   const p = new URLSearchParams();
   if (q.severity && q.severity !== "all") p.set("severity", q.severity);
   if (q.status && q.status !== "all") p.set("status", q.status);
+  if (q.reportState && q.reportState !== "all") p.set("report_state", q.reportState);
+  if (q.verificationStatus && q.verificationStatus !== "all") p.set("verification_status", q.verificationStatus);
   if (q.vulnclass && q.vulnclass !== "all") p.set("vulnclass", q.vulnclass);
   if (q.task && q.task !== "all") p.set("task_id", q.task);
   if (q.query?.trim()) p.set("q", q.query.trim());
@@ -230,12 +257,13 @@ function interceptPageQuery(page: number, size: number, filter: InterceptApprova
   const query = new URLSearchParams({ page: String(page), size: String(size) });
   if (filter.status) query.set("status", filter.status);
   if (filter.decision_source) query.set("decision_source", filter.decision_source);
+  if (filter.decided_by) query.set("decided_by", filter.decided_by);
   return query.toString();
 }
 
 export const api = {
   // Backend application version (injected via ldflags at release, default "dev").
-  health: () => get<{ ok: boolean; service: string; version: string }>("/health"),
+  health: () => get<{ ok: boolean; service: string; version: string; latest_version?: string }>("/health"),
 
   // ---- auth ----
   authStatus: () => get<{ initialized: boolean }>("/auth/status"),
@@ -255,6 +283,7 @@ export const api = {
     description: string;
     goal: string;
     llmProfileIds?: number[];
+    llmRotate?: boolean;
     sourceTaskIds?: string[];
     companyIds?: number[];
     timeoutSeconds?: number;
@@ -270,6 +299,7 @@ export const api = {
       description: input.description,
       goal: input.goal,
       llm_profile_ids: input.llmProfileIds ?? [],
+      llm_rotate: input.llmRotate ?? false,
       source_task_ids: input.sourceTaskIds ?? [],
       company_ids: input.companyIds ?? [],
       timeout_seconds: input.timeoutSeconds ?? 0,
@@ -307,10 +337,11 @@ export const api = {
     input: Partial<Pick<TaskTemplate, "name" | "description" | "goal" | "category_id" | "intercept_rules">>,
   ) => patch<TaskTemplate>(`/task-templates/${id}`, input),
   deleteTaskTemplate: (id: number) => del<{ deleted: number }>(`/task-templates/${id}`),
-  updateTaskLLMProfiles: (id: string, llmProfileIds: number[], activeLLMProfileId?: number) =>
+  updateTaskLLMProfiles: (id: string, llmProfileIds: number[], activeLLMProfileId?: number, llmRotate?: boolean) =>
     put<{
       id: string;
       llm_profile_ids: number[];
+      llm_rotate: boolean;
       active_llm_profile_id?: number;
       llm_failover_state: string;
       reopened_intents: number;
@@ -318,6 +349,7 @@ export const api = {
     }>(`/tasks/${id}/llm`, {
       llm_profile_ids: llmProfileIds,
       active_llm_profile_id: activeLLMProfileId ?? null,
+      llm_rotate: llmRotate,
     }),
   deleteTask: (id: string, options: DeleteTaskOptions) => del<DeleteTaskResult>(`/tasks/${id}`, options),
   controlTask: (id: string, action: "pause" | "resume") =>
@@ -383,6 +415,9 @@ export const api = {
       tested: number;
       pct: number | null;
       by_type: { type: string; total: number; tested: number }[];
+      // coverage ledger (absent when the feature is off): gaps = open items; an unexamined class is never clean
+      gaps?: { kind: string; surface?: string; risk_area: string }[];
+      completeness?: { complete: boolean; state: string; caveat: string };
     }>(`/tasks/${id}/coverage`),
   // Asset coverage graph: every in-scope asset + root-domain/company nodes used for connection, with tested/in_scope.
   taskCoverageGraph: (id: string) => get<CoverageGraphData>(`/tasks/${id}/coverage-graph`),
@@ -456,7 +491,7 @@ export const api = {
       headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
       body: fd,
     });
-    if (!r.ok) throw new Error(`Upload failed: ${r.status}`);
+    if (!r.ok) throw new Error(t("Upload failed: {error}", { error: r.status }));
     return r.json() as Promise<{ uploaded: number }>;
   },
   workspaceDownload: async (path: string) => {
@@ -468,7 +503,7 @@ export const api = {
       const r = await fetch(`/api/workspace/download?path=${encodeURIComponent(path)}`, {
         headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
       });
-      if (!r.ok) throw new Error(`Download failed: ${r.status}`);
+      if (!r.ok) throw new Error(t("Download failed: {error}", { error: r.status }));
       blob = await r.blob();
     }
     const objUrl = URL.createObjectURL(blob);
@@ -582,7 +617,7 @@ export const api = {
     const r = await fetch(`/api/exploration/findings/export?${p.toString()}`, {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
     });
-    if (!r.ok) throw new Error(`export: ${r.status}`);
+    if (!r.ok) throw new Error(t("Export failed: {error}", { error: r.status }));
     const blob = await r.blob();
     // Prefer the backend's Content-Disposition for the filename; fall back to a default name.
     const disp = r.headers.get("Content-Disposition") ?? "";
@@ -657,8 +692,8 @@ export const api = {
       { headers: token ? { Authorization: `Bearer ${token}` } : {} },
     );
     if (!response.ok) {
-      const error = await response.json().catch(() => ({ error: "Download failed" }));
-      throw new Error(error.error ?? "Download failed");
+      const error = await response.json().catch(() => ({ error: t("Download failed") }));
+      throw new Error(error.error ?? t("Download failed"));
     }
     const blob = await response.blob();
     const url = URL.createObjectURL(blob);
@@ -671,11 +706,25 @@ export const api = {
   // Vulnerability lineage: the subgraph (nodes + edges) from the vulnerability node back to the task's initial node.
   findingLineage: (id: string) => get<{ nodes: TaskNode[]; edges: Edge[] }>(`/exploration/findings/${id}/lineage`),
   setFindingStatus: (id: string, status: FindingStatus) => patch<Finding>(`/exploration/findings/${id}`, { status }),
+  setFindingReportState: (id: string, report_state: FindingReportState) =>
+    patch<Finding>(`/exploration/findings/${id}`, { report_state }),
+  // Bulk triage: one transaction server-side, with a per-id result. Unknown ids
+  // come back as found=false instead of failing the whole batch.
+  bulkSetFindingStatus: (ids: string[], status: FindingStatus) =>
+    post<{ updated: number; missing: number; results: { id: number; found: boolean; changed: boolean }[] }>(
+      "/exploration/findings/bulk-status",
+      { ids: ids.map(Number), status },
+    ),
+  bulkSetFindingReportState: (ids: string[], report_state: FindingReportState) =>
+    post<{ updated: number; missing: number; results: { id: number; found: boolean; changed: boolean }[] }>(
+      "/exploration/findings/bulk-report-state",
+      { ids: ids.map(Number), report_state },
+    ),
   setFindingSeverity: (id: string, severity: Severity) => patch<Finding>(`/exploration/findings/${id}`, { severity }),
   // Save a vulnerability's name/class/severity in one call (inline edit in the findings list); only present fields are sent.
   updateFinding: (
     id: string,
-    fields: { name?: string; vulnclass?: string; severity?: Severity; status?: FindingStatus },
+    fields: { name?: string; vulnclass?: string; severity?: Severity; status?: FindingStatus; report_state?: FindingReportState },
   ) => patch<Finding>(`/exploration/findings/${id}`, fields),
   // Delete a vulnerability: removes the findings record + the source exploration node (gone from the findings list, the task findings tab, and the exploration graph together).
   deleteFinding: (id: string) => del<{ deleted: boolean; id: number }>(`/exploration/findings/${id}`),
@@ -791,6 +840,7 @@ export const api = {
       body?: string;
       path?: string;
       status?: string;
+      rewritten?: string;
       respMin?: string;
       respMax?: string;
       sort?: string;
@@ -805,12 +855,37 @@ export const api = {
         (opts.body ? `&body=${encodeURIComponent(opts.body)}` : "") +
         (opts.path ? `&path=${encodeURIComponent(opts.path)}` : "") +
         (opts.status && opts.status !== "all" ? `&status=${encodeURIComponent(opts.status)}` : "") +
+        (opts.rewritten && opts.rewritten !== "all" ? `&rewritten=${encodeURIComponent(opts.rewritten)}` : "") +
         (opts.respMin ? `&resp_min=${encodeURIComponent(opts.respMin)}` : "") +
         (opts.respMax ? `&resp_max=${encodeURIComponent(opts.respMax)}` : "") +
         (opts.sort ? `&sort=${encodeURIComponent(opts.sort)}` : "") +
         (opts.order ? `&order=${encodeURIComponent(opts.order)}` : ""),
     ),
   trafficExchange: (id: string) => get<TrafficDetail>(`/traffic/exchange?id=${encodeURIComponent(id)}`),
+  // One page of a WebSocket/SSE exchange's messages, in order.
+  trafficStream: (id: string, offset = 0, limit = 50) =>
+    get<TrafficStreamPage>(`/traffic/stream?exchange=${encodeURIComponent(id)}&offset=${offset}&limit=${limit}`),
+  // Raw bytes of one stored blob (a full message payload or an oversized body).
+  // The JSON-only `get` cannot carry binary, hence the direct fetch.
+  trafficBlob: async (hash: string) => {
+    if (MOCK) throw new Error(t("Blob download is not available in mock mode"));
+    const token = getToken();
+    const r = await fetch(`/api/traffic/blob?hash=${encodeURIComponent(hash)}`, {
+      headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+    });
+    if (!r.ok) throw new Error(t("Blob download failed: {error}", { error: r.status }));
+    return new Uint8Array(await r.arrayBuffer());
+  },
+  // Re-sends an edited request through the proxy (bypasses capture rewrite rules
+  // unless req.apply_rules is true). Errors carry the HTTP status (ApiError):
+  // 413 body too large, 502 proxy/upstream, 503 capture off, 504 timeout.
+  trafficReplay: async (req: TrafficReplayRequest) => {
+    if (MOCK) throw new Error(t("Replay is not available in mock mode"));
+    return post<TrafficReplayResult>(`/traffic/replay`, {
+      ...req,
+      apply_rules: Boolean(req.apply_rules),
+    });
+  },
   trafficHosts: () => get<{ hosts: TrafficHost[] }>(`/traffic/hosts`),
   trafficDeleteHost: (host: string) => del<{ deleted: number }>(`/traffic?host=${encodeURIComponent(host)}`),
   trafficDeleteHosts: (hosts: string[]) => del<{ deleted: number }>(`/traffic/hosts`, { hosts }),
@@ -821,12 +896,14 @@ export const api = {
   // ---- app settings (runtime toggles) ----
   settings: () => get<Settings>(`/settings`),
   setSettings: (patch: Partial<Settings>) => put<Settings>(`/settings`, patch),
+  noiseStatus: () => get<import("@/lib/types").NoiseStatus>(`/settings/noise`),
   // Run a real "test" search with the given (or saved) config to verify it works.
   testWebSearch: (patch: {
     web_search_backend?: string;
     web_search_proxy?: string;
     brave_search_api_key?: string;
     tavily_search_api_key?: string;
+    keenable_search_api_key?: string;
   }) => post<{ ok: boolean; error?: string; count?: number; backend?: string }>(`/settings/web-search/test`, patch),
 
   // ---- Vulnerability IM push ----
@@ -877,7 +954,7 @@ export const api = {
     const r = await fetch(`/api/report${tq(task)}`, {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
     });
-    if (!r.ok) throw new Error(`report: ${r.status}`);
+    if (!r.ok) throw new Error(t("Report failed: {error}", { error: r.status }));
     return r.text();
   },
   chatMentions: (kind: string, query: string, signal?: AbortSignal, cursor = "") =>
@@ -890,6 +967,10 @@ export const api = {
   chatStatus: (taskId: string) => get<{ running: boolean }>(`/tasks/${taskId}/chat/status`),
   // Option 1, file upload: lands in the session/task working directory uploads/, returning a relative path the agent can Read.
   chatUpload: async (scope: "task" | "session" | "staging", id: string, files: File[]) => {
+    const totalSize = files.reduce((total, file) => total + file.size, 0);
+    if (totalSize > MAX_CHAT_UPLOAD_BYTES) {
+      throw new Error(t("Files exceed the 512 MiB upload limit (combined size)."));
+    }
     if (MOCK)
       return {
         attachments: files.map((f) => ({
@@ -907,7 +988,7 @@ export const api = {
       headers: { ...(token ? { Authorization: `Bearer ${token}` } : {}) },
       body: fd,
     });
-    if (!r.ok) throw new Error(`Upload failed: ${r.status} ${await r.text()}`);
+    if (!r.ok) throw new Error(t("Upload failed: {error}", { error: `${r.status} ${await r.text()}` }));
     return r.json() as Promise<{ attachments: ChatAttachment[] }>;
   },
   stopChat: (taskId: string) => post<{ status: string }>(`/tasks/${taskId}/chat/stop`, {}),
@@ -949,6 +1030,7 @@ export const api = {
     profile_id?: number,
     streaming = true, // test with the profile's real streaming mode so "streaming works, non-streaming does not" never leaks into conversations
     session_header_key = "", // non-empty = the test request also carries this custom session header (value is a one-off session id)
+    user_agent = "", // non-empty = the test overrides the User-Agent header with this value
   ) =>
     // reply = the model's actual reply (truncated); the backend marks a profile that replies with nothing as failed
     post<{ ok: boolean; error?: string; latency_ms?: number; model?: string; reply?: string }>("/llm/test", {
@@ -962,6 +1044,7 @@ export const api = {
       profile_id,
       streaming,
       session_header_key,
+      user_agent,
     }),
   llmProfiles: () => get<{ profiles: LLMProfile[] }>("/llm/profiles").then((r) => arr(r.profiles)),
   saveLLMProfile: (p: {
@@ -983,6 +1066,7 @@ export const api = {
     max_tokens?: number; // output cap per reply; 0 = not sent, the server default decides
     max_tokens_field?: string; // ""=max_tokens (default) | "max_completion_tokens" (openai format only)
     session_header_key?: string; // non-empty = send this HTTP header on every request, value = the current session id; "" = not sent
+    user_agent?: string; // non-empty = override the User-Agent header on every request; "" = keep the default UA
     retry?: LLMRetryOverride; // this profile's retry override; all zeros = follow the global retry policy
   }) => post<{ id: number }>("/llm/profiles", p),
   deleteLLMProfile: (id: string) => del<{ deleted: number }>(`/llm/profiles/${id}`),
@@ -1105,7 +1189,7 @@ export const api = {
     t: Pick<Tool, "description" | "schema" | "agents" | "enabled" | "kind" | "exec" | "deferred">,
   ) => put<{ ok: boolean }>(`/tools/custom/${key}`, t),
   deleteCustomTool: (key: string) => del<{ deleted: string }>(`/tools/custom/${key}`),
-  testCustomTool: (body: { kind: string; exec: Record<string, unknown>; params: Record<string, unknown> }) =>
+  testCustomTool: (body: { key?: string; kind: string; exec: Record<string, unknown>; params: Record<string, unknown> }) =>
     post<{ output: string; is_error: boolean }>("/tools/custom/test", body),
   detectPython: () => post<{ python_interpreter: string }>("/settings/python/detect", {}),
 
@@ -1168,7 +1252,7 @@ export const api = {
       headers: token ? { Authorization: `Bearer ${token}` } : {},
     });
     const body = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(body?.error || `Upload failed (${r.status})`);
+    if (!r.ok) throw new Error(body?.error || t("Upload failed ({status})", { status: r.status }));
     return body;
   },
   deleteSkill: (name: string) => del<{ deleted: string }>(`/skills/${name}`),
@@ -1224,6 +1308,12 @@ export const api = {
   interceptGetOne: (id: number) => get<InterceptPending>(`/intercept/pending/${id}`),
   interceptDecide: (id: number, decision: "allowed" | "denied") =>
     post<{ ok: boolean }>(`/intercept/pending/${id}/decide`, { decision }),
+  // 200 even on partial failure: each id carries its own ok/error.
+  interceptBatchDecide: (ids: number[], decision: "allowed" | "denied") =>
+    post<import("@/lib/types").InterceptBatchDecideResult>("/intercept/pending/batch-decide", { ids, decision }),
+  // No body: the server derives the rule from the stored request, which stays pending.
+  interceptAlwaysAllow: (id: number) =>
+    post<{ rule: InterceptRule; created: boolean }>(`/intercept/pending/${id}/always-allow`),
   interceptExecution: (id: number, conversationId?: number) =>
     get<import("@/lib/types").InterceptExecution>(
       `/intercept/history/${id}/execution${conversationId ? `?conversation=${conversationId}` : ""}`,

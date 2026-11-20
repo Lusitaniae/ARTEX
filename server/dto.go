@@ -63,6 +63,7 @@ type TaskDTO struct {
 	CompanyIDs         []int64            `json:"company_ids"`
 	CoverageEnabled    bool               `json:"coverage_enabled"` // asset coverage feature switch (fixed at creation)
 	PlanQuietMode      bool               `json:"plan_quiet_mode"`  // planner quiet-mode switch (#86), editable mid-run
+	TargetGate         bool               `json:"target_gate"`      // approval gate for asset targets, opt-in, editable mid-run
 }
 
 // FindingSeverityDTO is the per-severity finding count shown in the task list (critical/high/medium/low).
@@ -81,9 +82,16 @@ func applyTaskArchiveBlocker(dto *TaskDTO, blockers map[int64]int64) {
 	if err != nil {
 		return
 	}
-	if dependentID := blockers[taskID]; dependentID > 0 {
-		dto.ArchiveBlockedBy = strconv.FormatInt(dependentID, 10)
+	applyTaskArchiveBlockerID(dto, blockers[taskID])
+}
+
+// applyTaskArchiveBlockerID records dependentID as the task's archive blocker;
+// 0 (nothing blocks it) leaves the DTO unchanged.
+func applyTaskArchiveBlockerID(dto *TaskDTO, dependentID int64) {
+	if dto == nil || dependentID <= 0 {
+		return
 	}
+	dto.ArchiveBlockedBy = strconv.FormatInt(dependentID, 10)
 }
 
 // TokenTotalDTO is a whole-task (all agents) token aggregate.
@@ -131,13 +139,14 @@ func taskDTO(t *Task, status string) TaskDTO {
 		LLMProfileID:       llmState.ProfileID,
 		LLMProfileIDs:      profileIDs,
 		ActiveLLMProfileID: llmState.ActiveID,
-		LLMRotate:          t.LLMRotate,
+		LLMRotate:          llmState.Rotate,
 		LLMFailoverState:   llmState.FailoverState,
 		LLMFailoverReason:  llmState.FailoverReason,
 		SourceTaskIDs:      sourceIDs,
 		CompanyIDs:         lifecycle.CompanyIDs,
 		CoverageEnabled:    t.CoverageEnabled,
 		PlanQuietMode:      t.PlanQuietMode,
+		TargetGate:         t.targetGate.Load(),
 	}
 }
 
@@ -159,6 +168,7 @@ type TrafficExchangeDTO struct {
 	Status      int    `json:"status"`
 	ContentType string `json:"content_type"`
 	RespLen     int    `json:"resp_len"`
+	Rewritten   bool   `json:"rewritten"`
 }
 
 func trafficDTOs(ex []traffic.ExchangeMeta) []TrafficExchangeDTO {
@@ -173,6 +183,7 @@ func trafficDTOs(ex []traffic.ExchangeMeta) []TrafficExchangeDTO {
 			Status:      e.Status,
 			ContentType: e.ContentType,
 			RespLen:     e.RespLen,
+			Rewritten:   e.Rewritten,
 		})
 	}
 	return out
@@ -312,16 +323,22 @@ type FindingDTO struct {
 	ReportEvidenceVersion int64                      `json:"report_evidence_version"`
 	ReportStale           bool                       `json:"report_stale"`
 	TrafficBindings       []db.FindingTrafficBinding `json:"traffic_bindings,omitempty"`
+	PoELevel              int                        `json:"poe_level"`
+	VerificationStatus    string                     `json:"verification_status"`
+	VerificationNote      string                     `json:"verification_note"`
+	Counterevidence       string                     `json:"counterevidence,omitempty"`      // what was tested and did not work; optional
+	ConfidenceRationale   string                     `json:"confidence_rationale,omitempty"` // why the conclusion holds; optional
 
-	ID        string `json:"id"`
-	FindingID string `json:"finding_id,omitempty"` // standalone findings-table id — the handle for status updates
-	VulnClass string `json:"vulnclass"`
-	Name      string `json:"name,omitempty"` // vulnerability name; the frontend falls back to displaying vulnclass when empty
-	Severity  string `json:"severity"`       // critical | high | medium | low
-	Status    string `json:"status"`         // pending | in_progress | confirmed | resolved | fixed | false_positive | ignored | duplicate | risk_accepted
-	Summary   string `json:"summary"`
-	Evidence  string `json:"evidence"`
-	Report    string `json:"report,omitempty"` // detailed report (Markdown); returned only by the detail endpoint, empty in lists
+	ID          string `json:"id"`
+	FindingID   string `json:"finding_id,omitempty"` // standalone findings-table id — the handle for status updates
+	VulnClass   string `json:"vulnclass"`
+	Name        string `json:"name,omitempty"` // vulnerability name; the frontend falls back to displaying vulnclass when empty
+	Severity    string `json:"severity"`       // critical | high | medium | low
+	Status      string `json:"status"`         // pending | in_progress | confirmed | resolved | fixed | false_positive | ignored | duplicate | risk_accepted
+	ReportState string `json:"report_state"`   // none | submitted | accepted | rejected | duplicate; workflow stage, not a triage verdict
+	Summary     string `json:"summary"`
+	Evidence    string `json:"evidence"`
+	Report      string `json:"report,omitempty"` // detailed report (Markdown); returned only by the detail endpoint, empty in lists
 
 	IntentID        string            `json:"intent_id,omitempty"`
 	ParamID         string            `json:"param_id,omitempty"`
@@ -447,19 +464,26 @@ func findingFromDB(f *db.DBFinding, assets map[int64]*db.Asset) FindingDTO {
 	if status == "" {
 		status = db.FindingPending
 	}
+	reportState := f.ReportState
+	if reportState == "" {
+		reportState = db.FindingReportNone
+	}
 	d := FindingDTO{
 		ID:           i64s(f.ID),
 		FindingID:    i64s(f.ID),
 		TrafficCount: f.TrafficCount, EvidenceVersion: f.EvidenceVersion, ReportEvidenceVersion: f.ReportEvidenceVersion,
 		ReportStale: f.Report != "" && f.EvidenceVersion != f.ReportEvidenceVersion, TrafficBindings: f.TrafficBindings,
-		VulnClass: f.VulnClass,
-		Name:      f.Name,
-		Severity:  f.Severity,
-		Status:    status,
-		Summary:   f.Summary,
-		Evidence:  f.Evidence,
-		Report:    f.Report,
-		TS:        rfc3339(f.CreatedAt),
+		PoELevel: f.PoELevel, VerificationStatus: f.VerificationStatus, VerificationNote: f.VerificationNote,
+		Counterevidence: f.Counterevidence, ConfidenceRationale: f.ConfidenceRationale,
+		VulnClass:   f.VulnClass,
+		Name:        f.Name,
+		Severity:    f.Severity,
+		Status:      status,
+		ReportState: reportState,
+		Summary:     f.Summary,
+		Evidence:    f.Evidence,
+		Report:      f.Report,
+		TS:          rfc3339(f.CreatedAt),
 	}
 	d.Assets = findingAssetDTOs(f.AssetIDs, assets)
 	if f.TaskID != nil {
@@ -594,7 +618,8 @@ type LLMProfileDTO struct {
 	Name            string  `json:"name"`
 	Format          string  `json:"format"`
 	BaseURL         string  `json:"base_url,omitempty"`
-	Proxy           string  `json:"proxy,omitempty"`
+	Proxy           string  `json:"proxy,omitempty"` // masked: the placeholder when set
+	ProxySet        bool    `json:"proxy_set"`
 	Model           string  `json:"model"`
 	APIKeyHint      string  `json:"api_key_hint,omitempty"`
 	RatePerSecond   float64 `json:"rate_per_second"`
@@ -617,6 +642,9 @@ type LLMProfileDTO struct {
 	// Custom session header name: when non-empty, every request carries this HTTP header,
 	// its value = the current session/intent's session id. '' = do not send. For gateways that key prompt caching/sticky routing off a session-id header.
 	SessionHeaderKey string `json:"session_header_key"`
+	// Custom User-Agent: when non-empty, every outbound LLM request overrides its
+	// User-Agent header with this value. '' = do not override (keep the default UA).
+	UserAgent string `json:"user_agent"`
 	// This profile's retry overrides (connect / empty response / same-provider safe
 	// window). Per item attempts: 0=inherit the global policy | -1=disable that retry
 	// layer | >0=count; interval_ms: 0=default exponential backoff | >0=use that fixed millisecond interval. All zero = fully follow the global policy, i.e. the historical behavior.
@@ -629,7 +657,8 @@ func llmProfileDTO(p *db.LLMProfile) LLMProfileDTO {
 		Name:             p.Name,
 		Format:           p.Format,
 		BaseURL:          p.BaseURL,
-		Proxy:            p.Proxy,
+		Proxy:            maskedSecret(p.Proxy),
+		ProxySet:         p.Proxy != "",
 		Model:            p.Model,
 		APIKeyHint:       p.APIKeyHint,
 		RatePerSecond:    p.RatePerSecond,
@@ -644,6 +673,7 @@ func llmProfileDTO(p *db.LLMProfile) LLMProfileDTO {
 		MaxTokens:        p.MaxTokens,
 		MaxTokensField:   p.MaxTokensField,
 		SessionHeaderKey: p.SessionHeaderKey,
+		UserAgent:        p.UserAgent,
 		Retry:            p.Retry,
 	}
 }

@@ -2,7 +2,9 @@ package server
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strconv"
@@ -11,6 +13,7 @@ import (
 
 	"github.com/Autumn-27/artex/agent"
 	"github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/norma/permission"
 	actool "github.com/Autumn-27/norma/tool"
 )
@@ -167,7 +170,7 @@ func (s *Server) delegateToTask(ctx context.Context, in json.RawMessage, pick fu
 		tsx.SetAssetStore(s.m.Assets(), s.m.Assets().Companies())
 	}
 	tsx.SetNotify(t.Notify)         // generic wake-up (write ops without a dedicated callback go through it; no-op for read tools)
-	tsx.SetNotifyHint(t.NotifyHint) // add_hint → records a "human added N strategic hints: ..." entry and wakes the planner
+	tsx.SetNotifyHint(t.NotifyHint) // add_hint → records an "orchestrator added N strategic hints: ..." entry and wakes the planner
 	return pick(tsx).Call(ctx, inner, nil)
 }
 
@@ -251,7 +254,7 @@ func (s *Server) toolSpawnTask() actool.CoreTool {
 			"plan_heartbeat_seconds": map[string]any{"type": "integer", "description": "optional: planner heartbeat interval (seconds). When this much time has passed since the last planning round ended/the task started with no trigger in between → run one planning round (deadlock backstop + wakes the planner to supervise in-flight workers). Empty or 0 = default 600 (10min);"},
 			"seed_first_intent":      map[string]any{"type": "boolean", "description": "optional: enable for simple tasks to issue one seed intent at creation (content = description + goal) so a worker can start testing right away without waiting for the first planner round; default false (the standard plan-then-execute flow)."},
 		}, "description", "goal"),
-		func(_ context.Context, in json.RawMessage) (actool.Result, error) {
+		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
 				Description          string          `json:"description"`
 				Goal                 string          `json:"goal"`
@@ -305,11 +308,32 @@ func (s *Server) toolSpawnTask() actool.CoreTool {
 			if pin != nil {
 				llmIDs = []int64{*pin}
 			}
+			// Target gate: a child spawned from a gated scope is gated too, and keeps
+			// the block rules of the calling task. Read from the caller's scope, never
+			// from parent_ref (optional and written by the model). Pins and allow rules
+			// are never copied. Gate-off caller or no scope: created as before.
+			var gate *bool
+			var blockRules []db.TaskInterceptRuleInput
+			if scope, ok := intercept.TargetScopeFromContext(ctx); ok && scope.Enabled != nil && scope.Enabled() {
+				on := true
+				gate = &on
+				if callerID, err := strconv.ParseInt(scope.TaskID, 10, 64); err == nil && callerID > 0 {
+					block, _, err := s.m.Assets().TaskInterceptRulesSplit(callerID)
+					if err != nil {
+						return actool.Errorf("read the block rules of the calling task: " + err.Error()), nil
+					}
+					for _, r := range block {
+						blockRules = append(blockRules, db.TaskInterceptRuleInput{Enabled: r.Enabled, Action: r.Action, Kind: r.Kind, Pattern: r.Pattern, Note: r.Note})
+					}
+				}
+			}
 			t, err := s.m.CreateTaskWithOptions(a.Description, a.Goal, db.TaskCreateOptions{
 				SourceTaskIDs:        sourceIDs,
 				LLMProfileIDs:        llmIDs,
 				TimeoutSeconds:       a.TimeoutSeconds,
 				PlanHeartbeatSeconds: a.PlanHeartbeatSeconds,
+				InterceptRules:       blockRules,
+				TargetGate:           gate,
 			})
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
@@ -430,26 +454,57 @@ func (s *Server) toolUpdateFindingReport() actool.CoreTool {
 			"finding_id":       map[string]any{"type": "integer", "description": "target vulnerability id (the id returned by report_finding)"},
 			"report":           strParam("full report text, Markdown format"),
 			"evidence_version": map[string]any{"type": "integer", "description": "evidence version returned by get_finding_traffic; prevents the report from overwriting newer evidence changes"},
+			"poe_level":        map[string]any{"type": "integer", "description": "proof-of-exploitation level 0-4: 1 error/timing/response variation, 2 structural manipulation, 3 actual data extracted, 4 critical impact. L3 is the minimum for verified. Omit or 0 when not proven."},
+			"evidence_quotes":  map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "exact lines copied from a bound proof/verification response body (get_finding_traffic). Never from memory; the server checks each one verbatim after whitespace normalization."},
 		}, "finding_id", "report"),
 		func(ctx context.Context, in json.RawMessage) (actool.Result, error) {
 			var a struct {
 				EvidenceVersion *int64          `json:"evidence_version"`
 				FindingID       json.RawMessage `json:"finding_id"`
 				Report          string          `json:"report"`
+				PoELevel        *int            `json:"poe_level"`
+				EvidenceQuotes  []string        `json:"evidence_quotes"`
 			}
 			_ = json.Unmarshal(in, &a)
 			nodeID := parseProfileID(a.FindingID) // reuses the "number or numeric string" parser
 			if nodeID <= 0 {
 				return actool.Errorf("invalid finding_id"), nil
 			}
+			poe := 0
+			if a.PoELevel != nil {
+				poe = *a.PoELevel
+			}
+			if poe < 0 || poe > 4 {
+				return actool.Errorf(fmt.Sprintf("invalid poe_level %d (want 0-4)", poe)), nil
+			}
+			notFound := actool.Errorf(fmt.Sprintf("no vulnerability record found for finding_id=%d (register it with report_finding first)", nodeID))
+			findingID, err := s.m.pg.FindingIDByNodeID(nodeID)
+			if errors.Is(err, sql.ErrNoRows) {
+				return notFound, nil
+			}
+			if err != nil {
+				return actool.Errorf(err.Error()), nil
+			}
 			n, err := s.m.pg.SetFindingReportVersionByNodeID(ctx, nodeID, a.Report, a.EvidenceVersion)
 			if err != nil {
 				return actool.Errorf(err.Error()), nil
 			}
 			if n == 0 {
-				return actool.Errorf(fmt.Sprintf("no vulnerability record found for finding_id=%d (register it with report_finding first)", nodeID)), nil
+				return notFound, nil
 			}
-			return actool.Text(fmt.Sprintf("finding %d report updated (%d chars)", nodeID, len(a.Report))), nil
+			// The report is saved above; verification only decides the status. A
+			// downgrade is recorded and reported, never used to drop the report.
+			status, note := s.assessFindingVerification(ctx, findingID, poe, a.EvidenceQuotes)
+			if err := s.m.pg.SetFindingVerification(findingID, status, poe, note); err != nil {
+				return actool.Errorf("report saved, but verification not recorded: " + err.Error()), nil
+			}
+			msg := fmt.Sprintf("finding %d report updated (%d chars)\nverification: %s", nodeID, len(a.Report), status)
+			if status == db.VerificationVerified {
+				msg += fmt.Sprintf(" (POE L%d)", poe)
+			} else {
+				msg += " - " + note + "\nwarning: the report is saved but the finding is not verified. To reach verified, declare poe_level 3 or 4 and pass exact quotes copied from a bound proof/verification response body."
+			}
+			return actool.Text(msg), nil
 		})
 }
 
@@ -503,6 +558,7 @@ func (s *Server) seedOrchestrationTools() {
 	s.seedWorkerReadToolsUnbind()  // list_facts/list_companies/list_worker_traces unbound from worker's defaults (one-time)
 	s.seedWorkerReadbackRebind()   // repairs an old migration's wrong removal: re-binds search_all_worker_traces/get_worker_trace/node_detail back onto worker (one-time)
 	s.seedTaskCredentialBindings() // save/list_task_credential onto worker + pentest (one-time, #3)
+	s.healListTaskCredentialsSchema()
 	s.seedAutoReportFindingBinding()
 	s.unbindGoalMetDefault()
 	s.reseedGoalsPrompt()             // goals prompt gains the "extract operation constraints" step → old DBs append a new default version (one-time)
@@ -513,9 +569,77 @@ func (s *Server) seedOrchestrationTools() {
 	s.upgradeReporterTriggerMessage() // backfill migration for old DBs: makes the reporter send evidence_version back (one-time)
 	s.seedFindingTrafficTools()       // adds optional evidence params and read-only evidence tools, preserving user config
 	s.seedFindingWorkflowTools()
+	s.seedFindingVerificationSchema() // S1: poe_level / evidence_quotes on update_finding_report, added once per DB
+	s.seedFindingEvidenceSchema()     // optional counterevidence / confidence_rationale on report_finding, added once per DB
+	s.seedFactInputSchema()           // restore record_fact single/batch contracts
+	s.seedFactSourceSchema()          // source enum on record_fact, added once per DB
+	s.seedTaskScopeDescription()      // add_task_scope: "coverage scope, not enforced" replaces the authorization-boundary text
 	// Note: pentest's default tool bindings need no migration — BuiltinToolSeeds already seeds
 	// list_assets/insert_assets/report_finding/list_findings/list_companies together with
 	// pentest at fresh initialization (no old DBs exist in this project, so no migration).
+}
+
+// seedFactSourceSchema adds the source property (closed enum) to the record_fact
+// schema of existing databases (SeedTool is first-insert only, and ToolResolve
+// serves the stored schema, so without this the model would never see the enum).
+// Idempotent: the property is added only when the stored schema lacks it, and user
+// edits are preserved.
+func (s *Server) seedFactSourceSchema() {
+	for _, seed := range agent.BuiltinToolSeeds() {
+		if seed.Key != "record_fact" {
+			continue
+		}
+		raw, err := json.Marshal(seed.Schema)
+		if err != nil {
+			log.Printf("[facts] record_fact schema: %v", err)
+			return
+		}
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &obj); err != nil {
+			return
+		}
+		var properties map[string]json.RawMessage
+		if err := json.Unmarshal(obj["properties"], &properties); err != nil {
+			return
+		}
+		if len(properties["source"]) == 0 {
+			return
+		}
+		_, err = s.m.pg.Exec(`UPDATE tools SET schema=jsonb_set(schema,ARRAY['properties','source'],$1::jsonb,true),updated_at=now()
+WHERE key='record_fact' AND system AND NOT(COALESCE(schema->'properties','{}'::jsonb) ? 'source')`, string(properties["source"]))
+		if err != nil {
+			log.Printf("[facts] upgrade record_fact.source: %v", err)
+		}
+		return
+	}
+}
+
+// oldTaskScopeDescription is the add_task_scope description as seeded up to commit
+// 0dc8bdf, which called task_scope the task's authorization boundary. Kept verbatim:
+// seedTaskScopeDescription replaces only a row that still holds exactly this text.
+const oldTaskScopeDescription = "Add test scope to [this task] — this is the task's authorization boundary, and also the denominator of asset test coverage.\n" +
+	"Supported kinds: company (all assets under the company) / root_domain (a whole root domain, including all subdomains) / subdomain (a single precise subdomain) / ip / cidr / icp / keyword.\n" +
+	"Note: hosts a worker touches one by one are [automatically] added to the scope by the system (precise subdomains); this tool is for [deliberate widening] — pulling in a whole root domain / whole company, or adding a specific subdomain/IP.\n" +
+	"value: for company pass the company name or id (the company must already exist); for root_domain/subdomain pass a domain; for ip/cidr pass an IP or range; for icp/keyword pass an ICP number or company keyword.\n" +
+	"Always give reason explaining the basis (auditable). Use the entries array for multiple entries."
+
+// seedTaskScopeDescription brings the add_task_scope description of existing
+// databases to the code text (SeedTool is first-insert only, and ToolResolve serves
+// the stored description, so without this the model would keep reading
+// "authorization boundary"). Idempotent: only a system row still holding the old
+// seeded text is replaced; an absent row or an operator-edited text is left alone.
+func (s *Server) seedTaskScopeDescription() {
+	for _, seed := range agent.BuiltinToolSeeds() {
+		if seed.Key != "add_task_scope" {
+			continue
+		}
+		_, err := s.m.pg.Exec(`UPDATE tools SET description=$1,updated_at=now()
+WHERE key='add_task_scope' AND system AND description=$2`, seed.Desc, oldTaskScopeDescription)
+		if err != nil {
+			log.Printf("[tools] upgrade add_task_scope description: %v", err)
+		}
+		return
+	}
 }
 
 // refreshBuiltinToolSchemas propagates code schema/description changes on the
@@ -908,6 +1032,19 @@ func (s *Server) seedTaskCredentialBindings() {
 		}
 	}
 	_ = s.m.pg.SetSetting(flag, "true")
+}
+
+// healListTaskCredentialsSchema repairs the list_task_credentials row seeded by
+// older builds, whose schema carried "required": [""] — strict providers reject
+// it, which fails every worker run. SeedTool is first-insert-only, so the code fix
+// alone never reaches an already-seeded row. Only that exact malformed value on
+// that one key matches, and only the "required" key is dropped: the rest of the
+// schema, the description, bindings and enabled flag are untouched. A healed row
+// no longer matches, so this needs no settings flag and is a no-op afterwards.
+func (s *Server) healListTaskCredentialsSchema() {
+	if _, err := s.m.pg.Exec(`UPDATE tools SET schema = schema - 'required', updated_at=now() WHERE key='list_task_credentials' AND schema->'required' = '[""]'::jsonb`); err != nil {
+		log.Printf("[tools] heal list_task_credentials schema failed: %v", err)
+	}
 }
 
 func (s *Server) seedWorkerReadbackRebind() {

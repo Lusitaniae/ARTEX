@@ -2,6 +2,184 @@
 
 All notable changes to this project are documented in this file. The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **Target noise governor**: one shared egress governor paces ARTEX's own HTTP requests (WebFetch, the http custom tools and the enrich probe) against a noise profile (`off` by default, `quiet`, `balanced`, `aggressive`): a per-host token bucket with jitter, per-host and global in-flight caps, 429/503 backoff, GET deduplication with a short cache, and a configurable target User-Agent (`ARTEX_TARGET_USER_AGENT`). Off is a strict passthrough (#205).
+- **Low-and-slow prompt block**: when a noise profile is set, the planner, worker, main agent and chat prompts carry the per-host limits of the profile and the exact rate or delay flags for nmap, nuclei, httpx, katana, ffuf, dalfox and sqlmap; with the profile off the prompts are unchanged (#212).
+- **Noise profile at runtime**: System settings has a **Target noise** card. It sets the profile (`off`, `quiet`, `balanced`, `aggressive`) through the `noise_profile` setting, which takes precedence over `ARTEX_NOISE_PROFILE`. The change applies to the next WebFetch, http custom tool and enrich request, and to the next agent prompt, without a restart. The card also shows the per-host counters, which `GET /api/settings/noise` returns (#233).
+- **Bash requests paced through the capture proxy**: with traffic capture on, the Bash proxy URL carries a marker userinfo. The recording proxy paces each request of a marked connection by the noise profile's per-host rate and jitter, and counts it, before it goes upstream. This applies inside CONNECT tunnels too. WebFetch, the http custom tools and enrich keep the unmarked URL and are not paced twice. The proxy now drops `Proxy-Authorization` from every request it forwards or records. This is best effort: only clients that honour the proxy are covered, with capture on (#234).
+- **Hierarchical budgets**, off by default: a task budget and a per-intent budget take the minimum of their own budget and the parent's remaining budget above the wrap-up reserve, planner calls count inside the task, and reaching the reserve forces a wrap-up (#206).
+- **Coverage ledger**: the worker records what it examined, ruled out or left open for each surface and risk class with `record_coverage`; gaps, unexamined classes and completeness appear in the planner context, `GET /api/tasks/{id}/coverage`, the coverage card and the Markdown report (#207).
+- **Closed-question judge**: the LLM fallback judge answers eight fixed questions that the code owns and the code takes the decision; every failure now leads to ask instead of allow, and the previous behaviour stays available as `llm_judge_mode = freeform` (#208).
+- **argv interception rules**: a new `match_type = argv` matches the parsed prefix of a Bash command exactly, and a pending Bash approval can create such a rule in one click; a code-owned denylist refuses programs where a prefix would allow arbitrary code (#210, #211).
+- **Scanner output ingestion**: `ingest_scan_output` parses nmap XML, nuclei JSONL, httpx JSONL and ffuf JSON, and writes assets and facts deterministically, so the model never reads the raw output (#214, #215).
+- **bbot ingestion**: a typed parser splits bbot JSONL events by `scope_distance`, only in-scope events go through `insert_assets`, and `ingest_bbot` reads the file line by line with a 64 KiB cap (#199, #200).
+- **Tool RAG**, off by default: when the bound tool list of an agent is large, only the subset relevant to the current intent is injected, as a projection that never adds or edits a tool (`ARTEX_TOOL_RAG`) (#204).
+- **Fact provenance**: `record_fact` takes a closed `source` enum (default `inference`) and every fact carries the server-set `origin`, both shown in `recent_facts`, `list_facts` and `expand_digest` (#194).
+- **Per-message nonce envelope**: agent- and target-derived fields reach the planner and worker user messages inside a code-owned data envelope with a random nonce per message; operator input stays outside it (#195).
+- **Intercept risk score and batch approval**: a deterministic risk score (low, medium, high) is shown on each pending approval, and up to 100 pending decisions can be settled in one call, each through the existing single-decision path (#232).
+- **`ask_operator` target warning**: a request whose question names a host or URL outside the goal targets is tagged as containing target-derived text (#197).
+- **Opt-in update banner**: `ARTEX_UPDATE_CHECK` makes the backend check the latest GitHub release at most once per 24 hours and the UI show a banner; off by default (#202).
+- **Release provenance**: release archives carry GitHub build provenance attestations and a CycloneDX SBOM (`gh attestation verify <zip> --repo BaaRai/ARTEX`); release notes are the matching `CHANGELOG.md` section (#219, #201).
+- **Capture-proxy rewrite rules, storage and API**: `GET`, `POST`, `PUT` and `DELETE /api/traffic/rewrite-rules` and `POST /api/traffic/rewrite-rules/{id}/toggle` manage rules that match a request or a response (method, host, URL, headers, body, status) and describe a rewrite (method, path and query, headers, body, status). Rules are validated on save, limited to 100 of which 50 enabled, created disabled, and stored in the new table `traffic_rewrite_rules` (migration `0005_traffic_rewrite_rules.sql`) with `matchers` and `actions` encrypted at rest. The value of an action marked `sensitive` is never returned, and an update sent without it keeps the stored one. The server compiles the enabled rules at startup and after every change and hands the snapshot to the proxy. The proxy applies them from the next entry. See `docs/traffic-rewrite-rules.md`.
+- **Capture-proxy rewrite rules applied**: the capture proxy applies enabled rules to each HTTP request before it is sent to the target and to each response before it reaches the client. Each action that ran is recorded in the new table `exchange_rewrites` in the same transaction as the exchange, `traffic_get` shows a `REWRITTEN` line, and `traffic_search` never finds a value a rule wrote. SSE status and headers are rewritten at the start of the stream. **WebSocket handshakes are not rewritten**: the capture library runs its hook after the upgrade, so the status and headers cannot be changed, and frames pass unchanged. **Responses of 5 MiB or more** are forwarded unchanged and not recorded in full, because the library does not call the response hook for them. Snapshots of original requests are capped at 1024 entries and 64 MiB. Replays (`POST /api/traffic/replay`) bypass capture rewrite rules by default via an internal `X-ARTEX-Replay-Nonce` header stripped unconditionally by the proxy, and apply the rules when opted in with `apply_rules: true` (the **Apply capture rewrite rules** checkbox in the Replay panel). `GET /api/traffic` exposes the proxy's `rewrite` counters (`large_responses`, `capacity_refusals`, `tombstone_drops`, `conversions`, `sweeps`), flags each exchange row with `rewritten`, and filters with `rewritten=all|rewritten|original` (also accepting `true`/`false`), surfaced with a filter control and row badge on the Traffic page. Traffic archives export version 2 with per-exchange `rewritten` and sorted distinct applied `rewrite_rule_ids` while remaining deterministic and backward-compatible with version 1 archives. The rule-management web UI comes later.
+- **Bulk finding status** (#298): select findings in the findings table and apply one disposition to all of them, up to 500 per call, in one transaction; each row still goes through the single-decision notification semantics and the change is mirrored onto its exploration node (#289).
+- **Stream message direction filter** (#379): `GET /api/traffic/stream` and the `traffic_messages` agent tool take an optional `direction` (`c2s` or `s2c`) that lists only one side of a WebSocket or SSE conversation. `total` and `offset` apply to the filtered list, each row keeps its `seq` in the whole stream, and the `meta` row (messages dropped past the recorder limits) stays in a filtered page. Any other value is a 400 (API) or a tool error.
+- **Traffic replay** (#266): replay a recorded request from the traffic detail with its method, URL, headers and stored body; replay is disabled when only the body preview is loaded.
+- **Finding proof strength in reports** (#268): the Markdown report and the export show each finding's proof strength next to its verification status.
+- **Opt-in Keenable web search backend** (#295): the search tool gains Keenable alongside Brave and Tavily; the key is stored encrypted and can be cleared independently.
+- **Durable activity outbox** (#300): activity rows that cannot be stored are written to the new `activity_outbox` table (migration `0006_activity_outbox.sql`) and replayed once on the next start. The server stops admitting new work before the drain, and a shutdown cancel leaves an in-flight intent claim running so the next start can reset it to open instead of recording it as done or blocked.
+- **LLM model search** (#284): the System → LLM model picker can search the model list, and the API-key field opts out of password-manager autofill.
+- **Finding report state** (#308): findings carry a `report_state` (`none`, `submitted`, `accepted`, `rejected`, `duplicate`) for what was sent to a bug bounty program, separate from the triage status; the bulk update accepts both fields, and restoring an older archive fills `none` (migration `0007_finding_report_state.sql`).
+
+### Changed
+
+- **Password changes revoke sessions**: a password change stores a monotonic `auth.password_version` in the same transaction as the hash. Tokens carry that version, so a token from an older version is rejected, including when two changes land in the same second. `reset-password.sh` writes the same counter and requires an ARTEX restart, because the process reads the version at startup. A failed write leaves the previous session valid. Log, activity, and side-question streams re-check the token and close after the version moves. If the version cannot be read at startup, sessions are rejected until the next login reads it.
+- **Task budgets survive a restart**: planner, worker, judge, and compactor rows in `llm_usage` are counted back into `ARTEX_TASK_BUDGET_*`. A restored task already inside the wrap-up reserve only has that reserve left, so the run wraps up instead of starting another worker. The per-worker estimate is not restored and starts from the defaults (50,000 tokens and 10 turns) until a worker finishes in this process. Chat, goal decomposition, and side questions stay outside the cap.
+- **Untrusted-output boundary is now on by default**: Norma frames tool results for the worker, planner, chat and main agent unless `ARTEX_UNTRUSTED_BOUNDARY` is set to `0`, `false`, `off` or `no`. It was opt-in via `ARTEX_UNTRUSTED_BOUNDARY=1` in 0.6.0 (#166); the default flips here (#203).
+- **Versioned migrations**: the `db` package applies numbered `db/migrations/NNNN_slug.sql` files once, in order, under the schema advisory lock, and records a SHA-256 checksum in `schema_migrations`; missing, renamed, changed or out-of-order migrations fail closed (#226).
+- **Coverage graph performance**: the coverage graph batches its connector lookups (three queries instead of one per root and per company) and adds the partial index `idx_ts_icp`; on a task of about 3,000 assets the p50 dropped from 126 ms to 27 ms and the queries per call from 221 to 3 (#230).
+- **Request body bounds** (#305): JSON request bodies decode at most 32 MiB, every non-multipart body is capped, and an oversized body answers 413 instead of a generic bad request. `ReadTimeout` bounds how long headers and the body may take to arrive without cutting a handler that is already running.
+- **Chat attachments up to 512 MiB** (#252): the client, server, compose file and reverse-proxy sample agree on a 512 MiB combined multipart limit.
+- **MITM passthrough TTL** (#306): a host that cannot be intercepted is tunnelled for one minute, then interception is tried again; an expired mark counts as intercepted.
+- **Norma v0.4.11** (#294).
+- **CI**: the suite also runs on the latest Go release as an advisory job, the rewrite-rule engine runs under the race detector, and the gzip/compression fixtures no longer depend on the local Go version (#279, #278).
+- **Repository hygiene** (#275): `docs/` is no longer ignored, and contributing documents the 7-open-pull-request cap (#307).
+
+### Fixed
+
+- **Workspace and skill symlink confinement**: workspace file operations, the skill file APIs and the skill loader resolve symlinks in every path component and refuse a target outside their root, so a link planted in the workspace or a skill directory cannot expose another file.
+- **Target gate behind proxies**: a target approval is name-only whenever a proxy is in the path, including the recording proxy, the global egress proxy and a custom tool's own proxy, so the gate never claims an IP binding the proxy does not enforce.
+- **Remote MCP response bound**: Streamable HTTP JSON-RPC bodies and SSE data payloads are refused above 8 MiB, so a remote MCP server cannot force an unbounded decode.
+- **LLM response capture bound**: each recorded provider attempt keeps at most 1 MiB, and a call keeps at most 8 attempts, so a large or retrying stream cannot grow the recorder without bound. The live stream is unchanged.
+- **Intercept audit ring**: `preToolUse` records allow only after intercept and the target gate decide, so a blocked call no longer leaves a leftover allow row in `Guard.Audit()`.
+- **DSN password redaction**: `config.Redact` now masks libpq `password=` keywords and `?password=` query values as well as URL userinfo, so a ping-failure log cannot print the database password.
+- **Asset DSL nesting**: `ParseDSL` refuses queries longer than 4 KiB or nested more than 32 parentheses deep, so a crafted `dsl` cannot grow the goroutine stack without bound.
+- **Retry-After overflow**: a 429/503 `Retry-After` of huge seconds no longer wraps `time.Duration` into a tiny delay. Values above `MaxDelay` are not retried.
+- **Conversation message pages**: `GET /api/conversations/{id}/messages` clamps `limit` (200 for history, 1000 for `?since=`), so a huge query cannot load the whole transcript in one response.
+- **Findings CSV formula cells**: `FindingsCSV` prefixes name, class, summary, task, and other text fields that start with `=`, `+`, `-`, `@`, tab, or CR so Excel/LibreOffice do not evaluate them as formulas when the export is opened.
+- **Asset service links**: the Services tab only uses an asset URL as `href` when it is `http:` or `https:`. `javascript:`, `data:`, and other schemes render as text.
+- **Chat session directories**: `ChatAgent.Chat` accepts only `[A-Za-z0-9_-]` session ids (at most 64 bytes) before joining them under `<workDir>/sessions`, so `..` and path separators cannot escape that directory.
+- **Change-password rate limit**: `POST /api/auth/change-password` uses the same limiter as login, keyed by client IP and by the session token, so a stolen session cannot guess the current password without backoff.
+- **Ingested traffic headers**: `RecordExternal` rejects a method that is not an HTTP token and header names or values that contain CR, LF, or NUL, matching Replay, so ingested exchanges cannot inject extra header lines into stored evidence.
+- **Browser MCP starts offline** (#329): the seeded `browser` MCP ran `npx @playwright/mcp`, which contacts the npm registry on every start even with the package installed globally, and Playwright MCP defaulted to a Chrome channel the image does not ship. It now runs the image's `playwright-mcp` binary with `--headless --browser chromium`. Existing databases that still have a stock `npx @playwright/mcp` row (including the common `-y` form) or a `playwright-mcp` row with no `--browser` are rewritten once; any other command or package is left alone. The image also installs the Chromium build `@playwright/mcp` and `@playwright/cli` expect, which is not the same build `playwright install` puts in the cache.
+- **CREATE DATABASE identifiers**: `ensureDatabase` now builds the statement with `pgx.Identifier`, which quotes the DSN database name and doubles any embedded quote, so the name cannot close the identifier. No database name PostgreSQL accepts is refused, so existing installs with a hyphen, a dot or non-ASCII characters keep starting.
+- **ask_operator image_path**: the screenshot path must resolve inside the run directory of the agent that asks (`<data>/tasks/<id>/i<N>` for a worker, `<data>/tasks/<id>/main` for the main agent). A relative path resolves from that directory and an absolute path must be inside it; `..` segments and symlinks that leave it are refused, so the tool cannot copy an arbitrary server image into the operator transcript. The copy is staged in `<data>/tasks/<id>/uploads`.
+- **ask_operator image_path, behavior change**: a worker that passed `i<N>/shot.png` relative to the task directory must now pass `shot.png` from its working directory, or an absolute path inside its run directory.
+- **insert_assets fail-closed**: when intercept or task allow/block rules cannot be loaded, `insert_assets` refuses the whole call instead of evaluating an empty rule set (which allowed every asset). The tool result does not include the underlying database error.
+- **BlobRange length no longer wraps int64**: `offset+length > size` overflowed when length was near MaxInt64, so the cap was skipped and `make([]byte, length)` could exhaust memory. The bound is now `length > size-offset`.
+- **PostgreSQL text[] literals escape backslashes**: `marshalStringArray` quoted double quotes but not backslashes, so a value ending in `\"` could close the current array element and inject another. It now doubles backslashes before quotes, matching `marshalJSONBArray`.
+- **Browser MCP env null no longer crashes startup**: a stored MCP `env` of JSON `null` unmarshaled into a nil map, and `syncBrowserMCPProxy` then assigned `NODE_EXTRA_CA_CERTS` when traffic capture was on, panicking the process on every start. `decodeStrMap` now always returns a writable map.
+- **Provider refusals reported as refusals**: a turn the provider's safety system declined (Anthropic `stop_reason: "refusal"`, OpenAI-compatible `finish_reason: "content_filter"`) has no text and no tool calls, so it ended as `completed` with "the model ended this turn normally", and the idle-turn rerun resent the same conversation up to the empty-response retry count, where it is expected to be refused again. The LLM recorder now hands each call's stop reason to the run (`llmrec.WithStopSink`, `agent.WithStopTracker`). After a refusal the idle-turn rerun is skipped, and the run summary says the provider refused the turn and the intent was not completed.
+- **LLM health badge on every task path**: `/system/llm/` read a breaker state that only the failover Pool wrote, so a profile used by an explicit task chain, by a bound agent with failover off, or as the global provider stayed "Healthy" through a real outage. Every task LLM attempt now records its outcome through the same policy the Pool uses, keyed by the profile that served it. The LLM recording page also explains an empty list when the `llm_record` toggle is off instead of looking broken.
+- **LLM health persistence** (#304): persisted breaker rows are applied in sequence at startup and written before the database closes, and a slow write no longer holds the registry lock while it runs.
+- **Skill visibility survives restarts**: turning a skill off now writes an explicit disabled row instead of deleting it, so the startup seed, which only inserts missing rows, can no longer bring the skill back. Skills that were turned off before this version have no row to keep, so they come back once after the upgrade and must be turned off again.
+- **Browser extension traffic capture**: CDP delivers `Network.responseReceived` response headers as an object, not an array of `{name, value}` records, so the extension threw on every response and never queued an exchange. It now accepts both shapes and lower-cases names before the body-capture gate, so captures work again and `content-type` correctly controls body capture.
+- **bbot on arm64**: the image now builds on arm64 hosts such as Apple Silicon. bbot's `gowitness` downloaded an x86-64 Chrome and `retirejs` an x86-64 Node, which can't run there, so the build failed. On arm64 the image uses Debian's `chromium` for gowitness and an arm64 Node for retirejs, and the build check now covers `retirejs` too. amd64 builds are unchanged.
+- **Auto-scope hygiene**: auto `task_scope` rows count for coverage and untested assets only under a declared root, and direct coverage counts anchored assets through fact anchors only; the scope is described as "coverage scope, not enforced" (#196).
+- **Enrich HTTP probe**: it now dials through `intercept.PinnedDialer`, so the target gate applies and a probe without a target scope is refused (#198).
+- **Agent hook data races**: the eight package-level hooks are synchronised, so a second wire-up no longer races tasks that already read them (#227).
+- **Coverage flag read failure** (#303): asset-coverage tools stay available when the coverage flag cannot be read, and a failed read no longer disables coverage for the task.
+- **RSI lesson correctness** (#287, #290): lessons are scoped from `task_scope`, UTF-8 is no longer split mid-character, caution lessons are looked up by cue, lesson evidence and every retest are retracted when a finding's disposition reverses, and extraction is skipped on a task with more than one company.
+- **Finding disposition mirror** (#289): finding triage is mirrored onto its exploration node, so the graph and the findings table agree.
+- **RSI lessons in the data envelope** (#288): lesson text reaches the planner and worker inside the same nonce-framed envelope as other target-derived content.
+- **Intent summaries framed** (#311): the intent summary on the worker-finished and finding lines, and the summaries in `graph_overview`, now reach the planner inside the nonce frame; the structured intent fields stay in the plain JSON, and the operator-typed deletion reason stays outside.
+- **LLM pool context window** (#286): the pool and side-question paths use the model's real context window instead of a default when computing compression thresholds.
+- **Sensitive rewrite values** (#273 follow-ups): a kept sensitive value is matched on action type, header name and regex, and a host change is refused while a stored sensitive value is kept.
+- **Triage bot context** (#274): the PR triage bot receives a directory map instead of a truncated file list.
+
+### Security
+
+- **Secrets at rest**: the credential-bearing columns and settings (LLM API keys and proxy, task credentials, MCP server env, notification channel config, search and proxy settings), the exec spec of custom tools and the evidence snapshot heads are encrypted in PostgreSQL with AES-256-GCM (`enc:v1:`) using `ARTEX_SECRET_KEY`, else `keys/secret.key`; existing plaintext rows are backfilled once at startup, and a missing or wrong key while encrypted data exists refuses to start. This protects database dumps and backups, not a running instance (#213, #216, #217, #218).
+- **URL credentials are dropped before storage**: scan and bbot ingestion, the asset store and archive restore strip URL userinfo, so `https://user:pass@host/app` is stored and matched as `https://host/app` (#222, #223, #224).
+
+## [0.6.0] - 2026-11-12
+
+Machine-checked finding verification (S1), intercept decisions traced to their actor, configurable notification limits, prompt hardening and goal guards from the #124 agentic audit, the target gate (S3b phase 1 and step 2.1, off by default and API-only), intent claim leases, and checksum-verified tool downloads in the Docker image.
+
+### Verified findings (S1)
+
+- **POE level and verification status**: findings carry `poe_level` (0-4), `verification_status` and `verification_note`; a finding is `verified` only with a bound proof or verification response, a declared POE level of 3 or more, and every evidence quote of 8 runes or more found verbatim in a bound body. Existing rows stay `unverified` (#162).
+- **Verification in the findings UI**: a badge (`Verified L3`/`L4`, `Unverified`, `Blocked`, `Not assessed`, `False positive`) beside the triage status, a filter, and the note on the detail page; the list, groups, asset tree and export accept `verification_status` (#163).
+- **Retest linkage**: a completed retest with verdict `reproduced` or `fixed` upgrades an `unverified`, `not_assessed` or `blocked` finding to `verified`, with a note naming the retest; other verdicts never change the state (#164).
+- **Evidence gzip decoding**: gzip and deflate bodies are decoded (one layer, 4 MiB cap, fail-closed) before the quote check, so compressed HTML can verify; brotli and zstd stay `not_assessed` (#169).
+- **Counterevidence and confidence rationale**: findings take two optional free-text fields, `counterevidence` (what was tried and did not work) and `confidence_rationale` (why the conclusion holds), through `report_finding`, the findings API and the finding detail page; a missing field never refuses a finding. An idempotent upgrade adds both properties to the stored `report_finding` schema on existing databases and keeps user edits (#193).
+
+### Intercept decision tracing
+
+- **`decided_by` on approvals**: each settled approval records its actor (`human`, `rule`, `model`, `system`), shown in a "Decided by" column with a filter; legacy rows show "Legacy" and are not rewritten (#165).
+- **Judge decisions no longer stored as `unknown`**: the `[model]`/`[Model]` prefix case mismatch is fixed, and an idempotent backfill relabels the affected rows `decision_source=model` (#159, fixes #156).
+
+### Notifications (closes #168)
+
+- **"and N more" counts the hidden items**: the notification asset list reported the total instead of the assets left out (#170); the malformed-IP asset warning had the same bug (#171).
+- **Configurable limits**: `notify_summary_max_runes` (default 120, 0-4000) and `notify_assets_max_shown` (default 3, 0-50) in `/api/settings`, `0` meaning no truncation; the Feishu card guard drops from 24000 to 16000 bytes to stay under the 20 KB request limit (#172).
+- **Limits on the settings page**: both fields under System > Notifications > Global settings, validated before anything is saved (#173).
+- **Feishu digest overflow**: digests are packed against the serialized request body, so a digest of many short items is split instead of exceeding 20 KB and being rejected (#174).
+
+### Agentic prompt hardening (#124 phase B)
+
+- **Untrusted-content tails owned by code**: the planner and the compactor get an untrusted-data rule appended after their prompt body, and the #49 block moves out of the editable bodies into a tail appended for every chat agent (worker, main agent, auto, pentest, reporter), so a prompt override cannot remove it (#189).
+- **Planner goal anchor**: the planner user message ends with a block that restates the task goal and constraints and asks each new intent to name the goal it serves (#189).
+- **bbot skill rules**: every bbot event field is untrusted, only `scope_distance == 0` reaches `insert_assets`, and other events stay intel facts that are never auto-scoped or probed (#189).
+
+### Agentic guards (#124 phase B)
+
+- **`goal_met` refuses while a goal is open**: it names the open count and points to `prove_goal`; a task with no goal node keeps the old behaviour (#190).
+- **`prove_goal` requires an observed fact**: a fact is accepted only with `confidence` `observed`; findings are accepted as before (#190).
+- **Hint origin**: `add_hint` stores who wrote the hint (`human`, `orchestrator` or the agent name) and the planner trigger names it, instead of always "The human (main agent)" (#190).
+- **Built-in rules for the planner and the main agent**: the `[built-in]` deny rules now apply to their Bash and other intercept-enabled tools; user rules and the judge still do not (#190).
+- **Deny reasons to the model are capped**: the reason in a block message (deny rule, judge or target gate) is cut to 4000 runes, with a truncation marker, before it reaches the model; the reason stored in the interception log is unchanged (#192).
+
+### Target gate (S3b phase 1 and 2.1): OFF by default, API-only
+
+- **Opt-in only**: `target_gate` on tasks and conversations defaults to `false` and is set through the API (`POST`/`PATCH`); there is no UI. With it off, nothing below runs. Decision D2 (gate on by default) is NOT in 0.6.0 (#178).
+- **Hooks and scope**: the planner and the main agent run with tool hooks, and every session carries a target-gate scope (#177).
+- **Schema, flag and approval requests**: `target_pins`, one open request per scope and `host:port`, and a human approval that pins the displayed addresses; pin list and revoke routes (#178).
+- **Extraction, resolver, exemptions, decision in the hook**: declared targets are extracted, block rules and exemptions applied, names resolved, and uncovered targets wait for a human approval (#179).
+- **Rendered custom-tool targets**: the URL or command that a custom `http` or `command` tool renders goes through the gate (#180).
+- **Inheritance**: a task spawned by a gated caller and a conversation triggered by a gated task start gated; pins are never copied (#182).
+- **Declared form first**: block and URL rules match the declared targets before any DNS lookup (#183).
+- **Redirect hops**: every redirect hop of WebFetch and of the custom `http` tool is checked; an uncovered hop fails with `TARGET_APPROVAL_PENDING` (#185).
+- **Pinned dialer**: in a gated scope, WebFetch and a direct custom `http` call connect only to pinned or exempt addresses, on every hop, with no direct retry (#186).
+
+### Other changes
+
+- **Custom User-Agent for LLM requests**: an optional per-profile `User-Agent` (trimmed, no control characters, 256 bytes max); empty keeps the default. Part of #154, without the fixed-full-URL mode (#155).
+- **Untrusted-output boundary toggle**: `ARTEX_UNTRUSTED_BOUNDARY=1` enables Norma's framing of tool results for worker, planner, chat and main agent; off by default (#166).
+- **Intent claim lease and fencing (S3c)**: a claim has a 15 s heartbeat, a 90 s TTL and an owner token, so a stale worker can no longer overwrite a result; in-flight intents reopen when their claim expires, not at startup (#176).
+
+### Fixed
+
+- **Custom-tool proxy scheme**: `use_recording_proxy` produced `http://http://...`; a value with a scheme is now used as is and a bare `host:port` gets `http://` (#187).
+- **`list_task_credentials` schema**: it emitted `"required": [""]`, which strict providers reject, failing every worker; fixed, with a one-time heal of existing databases at startup. Reported and first fixed by @kiserufetch (#130).
+- **MCP protocol version**: the Streamable HTTP client negotiates the version (offers 2025-11-25, then 2025-06-18) and sends the negotiated one after `initialize` (#132, fixes #131).
+
+### Build, Docker and tests
+
+- **Docker tool verification**: the recon tools are checked against their release checksums, sqlmap is pinned to tag 1.9.9 at a fixed commit, Node 22.23.4 comes from nodejs.org verified against `SHASUMS256.txt`, and the Playwright packages are pinned. Carries over the Dockerfile part of #127 (#188).
+- **Secrets out of the build context**: `.dockerignore` excludes `.env`, `config.json`, `jwt.key` and `backups` (#153).
+- **Server tests skip without a DSN**: the Postgres-backed `./server` tests skip when no database is configured instead of failing (#175).
+- **Norma v0.4.4 to v0.4.8**: v0.4.5 (#160), v0.4.6 (#161), v0.4.7 (#184), v0.4.8 (#186).
+
+### Docs
+
+- **LLM base URL note in the README**: the Anthropic base has no `/v1` suffix; OpenAI-format bases end in `/v1` (`/chat/completions` or `/responses` is appended). Follow-up to #154 (#157, #158).
+
+### Known limits
+
+- **Target gate**: OFF by default and API-only; turning it on by default (D2) is not part of this release.
+- **Declared-input detection, not enforcement, for subprocesses**: the gate reads the targets a call declares; a subprocess that builds its target at run time, or a custom script tool's stored code, is not seen. Only WebFetch and direct custom `http` calls are bound at connect time; calls through a proxy are not (recording-proxy binding is step 2.2).
+- **URL rules match the URL as written**, with no normalisation; use a domain, IP or CIDR rule to keep an agent away from a host (#183).
+- **Fact provenance**: `prove_goal` trusts the `confidence` the model declared in `record_fact`; F4 fact provenance and the source check come in 0.7.0. There is no pending-proof UI.
+- **Prompt rules are advisory to the model**: the tails, the goal anchor and the skill rules are prompt text, and their effect on model behaviour was not measured. The enforced parts are the `goal_met`/`prove_goal` handlers, the built-in deny rules and the target gate.
+- **Stored tool descriptions**: the new `add_hint` and `prove_goal` descriptions reach fresh databases only (#190).
+- **Intent claim leases need one version per database**: an older binary does not heartbeat, so a 0.6.0 instance takes over its live claims (#176).
+- **Verification**: no path produces `blocked` or `false_positive` yet, and non-HTTP findings stay `unverified` until S1b.
+- **Finding reasoning fields are not enforced**: the prompts and the `report_finding` descriptions ask for `counterevidence` and `confidence_rationale` when confidence is not high, but findings have no confidence field, so nothing requires them; a confidence field and its enforcement are 0.7.0 items. The prompt sentence reaches fresh databases only; the schema descriptions reach existing ones through the upgrade (#193).
+
 ## [0.5.1] - 2026-11-05
 
 Login rate limiting per client IP with trusted-proxy support, a 12-character minimum for new passwords, a loopback-only default for the binary, and the JWT signing key in its own Docker volume.
@@ -990,7 +1168,8 @@ First release of this fork. The engine underneath is still upstream's, but this 
 - [@Autumn-27](https://github.com/Autumn-27)
 - [@neouks](https://github.com/neouks)
 
-[Unreleased]: https://github.com/BaaRai/ARTEX/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/BaaRai/ARTEX/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/BaaRai/ARTEX/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/BaaRai/ARTEX/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/BaaRai/ARTEX/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/BaaRai/ARTEX/compare/v0.3.15...v0.4.0

@@ -13,14 +13,18 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Autumn-27/artex/agent"
+	"github.com/Autumn-27/artex/config"
 	pgdb "github.com/Autumn-27/artex/db"
+	"github.com/Autumn-27/artex/egress"
 	"github.com/Autumn-27/artex/enrich"
 	"github.com/Autumn-27/artex/guard"
 	"github.com/Autumn-27/artex/intercept"
 	"github.com/Autumn-27/artex/traffic"
+	"github.com/Autumn-27/artex/traffic/rewrite"
 	actool "github.com/Autumn-27/norma/tool"
 )
 
@@ -52,13 +56,13 @@ type Task struct {
 	LLMChainRevision   int64   `json:"-"`
 	LLMFailoverState   string  `json:"llm_failover_state,omitempty"`
 	// LLMRotate (#85): per-intent round-robin over the task's LLM chain heads.
-	LLMRotate  bool `json:"llm_rotate,omitempty"`
-	rotateMu   sync.Mutex
-	rotateNext int
-	LLMFailoverReason  string  `json:"llm_failover_reason,omitempty"`
-	SourceTaskIDs      []int64 `json:"source_task_ids,omitempty"`
-	CompanyIDs         []int64 `json:"company_ids,omitempty"`
-	Status             string  `json:"status"` // persisted lifecycle status (done/failed/timeout are terminal; empty/other is derived from runtime state)
+	LLMRotate         bool `json:"llm_rotate,omitempty"`
+	rotateMu          sync.Mutex
+	rotateNext        int
+	LLMFailoverReason string  `json:"llm_failover_reason,omitempty"`
+	SourceTaskIDs     []int64 `json:"source_task_ids,omitempty"`
+	CompanyIDs        []int64 `json:"company_ids,omitempty"`
+	Status            string  `json:"status"` // persisted lifecycle status (done/failed/timeout are terminal; empty/other is derived from runtime state)
 	// Task-level timeout (see docs/task-timeout-and-settle-design.md). DeadlineAt/FirstRunAt are unix seconds, 0 = unset/not yet run.
 	TimeoutSeconds       int                    `json:"timeout_seconds"`
 	PlanHeartbeatSeconds int                    `json:"plan_heartbeat_seconds"` // planner heartbeat trigger interval (seconds)
@@ -68,9 +72,14 @@ type Task struct {
 	DeadlineAt           int64                  `json:"deadline_at,omitempty"`
 	Store                *pgdb.ExplorationStore `json:"-"`
 	Guard                *guard.Guard           `json:"-"`
+	TargetGuard          *guard.Guard           `json:"-"` // planner and main-agent hooks: target gate only
 	notify               chan struct{}
 	lifecycleMu          sync.RWMutex
 	llmMu                sync.RWMutex
+	// targetGate is the task's opt-in to the approval gate for asset targets.
+	// Atomic: it is switched through the API while tool calls read it.
+	targetGate  atomic.Bool
+	interceptor *intercept.Interceptor // owner of the target gate, handed to the scope
 
 	// pendingTriggers accumulates the concrete changes (worker done / finding) that
 	// fired planning rounds since the last one consumed them. The debounce coalesces
@@ -153,6 +162,7 @@ func (t *Task) updateLifecycle(update func(*taskLifecycleState)) {
 }
 
 type taskLLMState struct {
+	Rotate         bool
 	ProfileID      *int64
 	ProfileIDs     []int64
 	ActiveID       *int64
@@ -173,6 +183,7 @@ func (t *Task) llmStateSnapshot() taskLLMState {
 	t.llmMu.RLock()
 	defer t.llmMu.RUnlock()
 	return taskLLMState{
+		Rotate:         t.LLMRotate,
 		ProfileID:      cloneInt64Ptr(t.LLMProfileID),
 		ProfileIDs:     append(make([]int64, 0, len(t.LLMProfileIDs)), t.LLMProfileIDs...),
 		ActiveID:       cloneInt64Ptr(t.ActiveLLMProfileID),
@@ -187,10 +198,12 @@ func (t *Task) llmStateSnapshot() taskLLMState {
 // chain. The active head stays authoritative for every non-worker role and for
 // failover ordering; rotation only distributes worker lanes across heads.
 func (t *Task) nextRotatedProfile() (int64, bool) {
+	t.llmMu.RLock()
+	defer t.llmMu.RUnlock()
 	t.rotateMu.Lock()
 	defer t.rotateMu.Unlock()
 	ids := t.LLMProfileIDs
-	if len(ids) == 0 {
+	if !t.LLMRotate || len(ids) == 0 {
 		return 0, false
 	}
 	pick := ids[t.rotateNext%len(ids)]
@@ -198,11 +211,14 @@ func (t *Task) nextRotatedProfile() (int64, bool) {
 	return pick, true
 }
 
-func (t *Task) setLLMState(profileID, activeID *int64, profileIDs []int64, revision int64, state, reason string) bool {
+func (t *Task) setLLMState(profileID, activeID *int64, profileIDs []int64, revision int64, state, reason string, rotate ...bool) bool {
 	t.llmMu.Lock()
 	defer t.llmMu.Unlock()
 	if revision < t.LLMChainRevision {
 		return false
+	}
+	if len(rotate) > 0 {
+		t.LLMRotate = rotate[0]
 	}
 	t.LLMProfileID = cloneInt64Ptr(profileID)
 	t.ActiveLLMProfileID = cloneInt64Ptr(activeID)
@@ -245,6 +261,12 @@ type Manager struct {
 	enrich      *enrich.Engine         // engine-side asset auto-completion (DNS/HTTP)
 	interceptor *intercept.Interceptor // user-configured tool-call interception rules
 
+	// Capture-proxy rewrite rules: rewriteMu serializes reloads, rewriteSet is
+	// the snapshot last compiled, rewriteErrors outlives the reloads.
+	rewriteMu     sync.Mutex
+	rewriteSet    atomic.Pointer[rewrite.Set]
+	rewriteErrors rewrite.ErrorLog
+
 	companyMu sync.Mutex // serializes task/company-scope commits with live handle registration
 	// taskStateMu preserves commit order between PostgreSQL lifecycle writes and
 	// their in-memory mirrors. lifecycleMu makes snapshots race-free, but without
@@ -255,12 +277,14 @@ type Manager struct {
 	active      string
 	trafficOn   bool // traffic capture switch (off by default; settings.traffic_capture)
 	llmRecOn    bool // LLM recording switch (off by default; settings.llm_record)
-	// Web search switch and source (off by default; settings.web_search_*). brave-free needs braveKey; tavily needs tavilyKey.
+	// Web search switch and source (off by default; settings.web_search_*). brave-free needs braveKey; tavily needs tavilyKey;
+	// keenable works keyless or with keenableKey.
 	// webSearchProxy is a separate egress proxy (http/https/socks5), unrelated to the MITM proxy that records traffic.
 	webSearchOn      bool
 	webSearchBackend string
 	braveKey         string
 	tavilyKey        string
+	keenableKey      string
 	webSearchProxy   string
 	// globalProxy is the egress proxy all target traffic routes through
 	// (http/https/socks5, optional user:pass). Empty = direct. When traffic
@@ -277,6 +301,7 @@ const (
 	settingWebSearchBackend    = "web_search_backend"
 	settingBraveKey            = "brave_search_api_key"
 	settingTavilyKey           = "tavily_search_api_key"
+	settingKeenableKey         = "keenable_search_api_key"
 	settingWebSearchProxy      = "web_search_proxy"
 	// settingGlobalProxy is the global egress proxy for all target traffic
 	// (http/https/socks5). Empty = direct. Distinct from web_search_proxy (which
@@ -297,6 +322,9 @@ const (
 	// when on, the four agent kinds wired into the platform (planner/worker/main
 	// agent/chat) have context compaction taken over by noa, replacing the built-in compaction. Read once per run; toggling affects only runs started afterwards.
 	settingNoaCompaction = "noa_compaction"
+	// Target noise profile (off|quiet|balanced|aggressive). When stored it wins over
+	// ARTEX_NOISE_PROFILE, which stays the fallback; applied at startup and on PUT.
+	settingNoiseProfile = "noise_profile"
 	// defaultWebSearchBackend is used when web search is on but no backend was picked.
 	defaultWebSearchBackend = "ddgs"
 	// deepSeekWebSearchBackend borrows the active LLM profile instead of its own
@@ -385,10 +413,16 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Before anything reads a stored secret: load the key, encrypt legacy plaintext.
+	if err := pg.InitSecrets(config.KeyDir()); err != nil {
+		pg.Close()
+		return nil, fmt.Errorf("secrets at rest: %w", err)
+	}
 	if err := pg.RecoverFindingRetests(); err != nil {
 		pg.Close()
 		return nil, fmt.Errorf("recover finding retests: %w", err)
 	}
+	egress.SetProfile(startupNoiseProfile(pg))
 	if err := pg.EnsureLLMRecordsTable(); err != nil {
 		log.Printf("[llmrec] create table: %v", err)
 	}
@@ -396,6 +430,13 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 		log.Printf("[llmusage] create table: %v", err)
 	}
 	m := &Manager{dir: dir, pg: pg, assets: pg.Assets(), tasks: map[string]*Task{}, interceptor: intercept.New(pg)}
+	// Behind any proxy in the path (the recording proxy, the global egress proxy,
+	// or a custom tool's own proxy) the proxy chooses the address, so a target
+	// approval is name-only.
+	m.interceptor.SetUpstreamProxyCheck(func() bool { return m.ProxyAddr() != "" })
+	m.interceptor.SetToolProxyCheck(m.toolUsesProxy)
+	// The platform's own endpoints need no target approval.
+	m.interceptor.SetDerivedExemptions(m.targetGateEndpoints)
 	if proxyAddr != "" {
 		tr, err := traffic.Open(filepath.Join(dir, "traffic"), proxyAddr)
 		if err != nil {
@@ -421,6 +462,7 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 		}
 		if tr != nil {
 			m.traffic = tr
+			m.reloadRewriteRules() // in place before the proxy accepts a connection
 			go func() {
 				log.Printf("[traffic] recording proxy on %s (set HTTP_PROXY=%s + trust _ca CA)", proxyAddr, tr.ProxyAddr())
 				if err := tr.Start(); err != nil {
@@ -446,6 +488,9 @@ func NewManager(dir, proxyAddr string) (*Manager, error) {
 	}
 	if v, ok, _ := pg.GetSetting(settingTavilyKey); ok {
 		m.tavilyKey = v
+	}
+	if v, ok, _ := pg.GetSetting(settingKeenableKey); ok {
+		m.keenableKey = v
 	}
 	if v, ok, _ := pg.GetSetting(settingWebSearchProxy); ok {
 		m.webSearchProxy = v
@@ -558,30 +603,32 @@ func (m *Manager) SetLLMPoolBindFallback(on bool) error {
 }
 
 // WebSearch returns the current web-search config: whether it is enabled, the
-// backend ("ddgs" | "brave-free" | "tavily"), the Brave API key, the Tavily API
-// key (each empty unless set), and the dedicated egress proxy (empty = direct).
-func (m *Manager) WebSearch() (on bool, backend, braveKey, tavilyKey, proxy string) {
+// backend ("ddgs" | "brave-free" | "tavily" | "keenable" | "deepseek"), the
+// Brave, Tavily and Keenable API keys (each empty unless set), and the
+// dedicated egress proxy (empty = direct). The Keenable key is optional: empty
+// selects the keyless public endpoint.
+func (m *Manager) WebSearch() (on bool, backend, braveKey, tavilyKey, keenableKey, proxy string) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	backend = m.webSearchBackend
 	if backend == "" {
 		backend = defaultWebSearchBackend
 	}
-	return m.webSearchOn, backend, m.braveKey, m.tavilyKey, m.webSearchProxy
+	return m.webSearchOn, backend, m.braveKey, m.tavilyKey, m.keenableKey, m.webSearchProxy
 }
 
 // WebSearchOpts returns the config as the agent-package struct the server pushes
 // into each agent. Disabled when off, or when a keyed backend is selected without
 // its key (so a half-configured backend never silently drops the tool at session build).
 func (m *Manager) WebSearchOpts() agent.WebSearchOpts {
-	on, backend, braveKey, tavilyKey, proxy := m.WebSearch()
+	on, backend, braveKey, tavilyKey, keenableKey, proxy := m.WebSearch()
 	if on && backend == "brave-free" && strings.TrimSpace(braveKey) == "" {
 		on = false
 	}
 	if on && backend == "tavily" && strings.TrimSpace(tavilyKey) == "" {
 		on = false
 	}
-	o := agent.WebSearchOpts{Enabled: on, Backend: backend, BraveKey: braveKey, TavilyKey: tavilyKey, Proxy: proxy}
+	o := agent.WebSearchOpts{Enabled: on, Backend: backend, BraveKey: braveKey, TavilyKey: tavilyKey, KeenableKey: keenableKey, Proxy: proxy}
 	if backend == deepSeekWebSearchBackend {
 		o.DeepSeekBaseURL, o.DeepSeekAPIKey, o.DeepSeekModel = m.deepSeekSearchCreds()
 	}
@@ -603,11 +650,11 @@ func (m *Manager) deepSeekSearchCreds() (baseURL, apiKey, model string) {
 	return p.BaseURL, p.APIKey, p.Model
 }
 
-// SetWebSearch persists and applies the web-search settings. braveKey, tavilyKey, and
-// proxy are each left untouched when nil (so toggling the switch doesn't wipe a saved
-// key/proxy; pass a pointer to "" to clear). Callers must rebuild agents (applyLLM)
-// afterwards so the settings take effect.
-func (m *Manager) SetWebSearch(on bool, backend string, braveKey, tavilyKey, proxy *string) error {
+// SetWebSearch persists and applies the web-search settings. braveKey, tavilyKey,
+// keenableKey and proxy are each left untouched when nil (so toggling the switch
+// doesn't wipe a saved key/proxy; pass a pointer to "" to clear). Callers must
+// rebuild agents (applyLLM) afterwards so the settings take effect.
+func (m *Manager) SetWebSearch(on bool, backend string, braveKey, tavilyKey, keenableKey, proxy *string) error {
 	backend = strings.TrimSpace(backend)
 	if backend == "" {
 		backend = defaultWebSearchBackend
@@ -636,6 +683,14 @@ func (m *Manager) SetWebSearch(on bool, backend string, braveKey, tavilyKey, pro
 		}
 		m.mu.Lock()
 		m.tavilyKey = *tavilyKey
+		m.mu.Unlock()
+	}
+	if keenableKey != nil {
+		if err := m.pg.SetSetting(settingKeenableKey, *keenableKey); err != nil {
+			return err
+		}
+		m.mu.Lock()
+		m.keenableKey = *keenableKey
 		m.mu.Unlock()
 	}
 	if proxy != nil {
@@ -730,8 +785,12 @@ func decodeStrSlice(raw json.RawMessage) []string {
 
 func decodeStrMap(raw json.RawMessage) map[string]string {
 	out := map[string]string{}
-	if len(raw) > 0 {
-		_ = json.Unmarshal(raw, &out)
+	if len(raw) == 0 {
+		return out
+	}
+	if err := json.Unmarshal(raw, &out); err != nil || out == nil {
+		// JSON null unmarshals into a nil map. Callers write env["k"]=v.
+		return map[string]string{}
 	}
 	return out
 }
@@ -774,6 +833,36 @@ func (m *Manager) ProxyAddr() string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.globalProxy
+}
+
+// toolUsesProxy reports whether a custom tool's own configuration sends its
+// traffic through a proxy. That call cannot enforce an approved IP, so the
+// target gate treats its pins as name-only. A recording-proxy tool is also
+// covered by ProxyAddr() when capture is on; the per-tool check covers a
+// tool-specific proxy while capture is off.
+func (m *Manager) toolUsesProxy(key string) bool {
+	if m.pg == nil {
+		return false
+	}
+	t, err := m.pg.GetTool(key)
+	if err != nil {
+		// A failed read cannot prove the call is direct; treat it as proxied.
+		return true
+	}
+	if t == nil || t.Kind != "http" {
+		return false
+	}
+	var spec struct {
+		Proxy             string `json:"proxy"`
+		UseRecordingProxy bool   `json:"use_recording_proxy"`
+	}
+	if json.Unmarshal(t.Exec, &spec) != nil {
+		return false
+	}
+	if strings.TrimSpace(spec.Proxy) != "" {
+		return true
+	}
+	return spec.UseRecordingProxy && m.ProxyAddr() != ""
 }
 
 // ProxyCACert returns the CA cert path agents must trust to verify HTTPS through
@@ -851,7 +940,7 @@ func unixNanoOrZero(t *time.Time) int64 {
 }
 
 func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Interceptor) *Task {
-	return &Task{
+	t := &Task{
 		ID: strconv.FormatInt(pt.ID, 10), ExpID: pt.ExplorationID,
 		Name:       pt.Name,
 		CategoryID: cloneInt64Ptr(pt.CategoryID), CategoryName: pt.CategoryName,
@@ -869,8 +958,46 @@ func taskFromPG(pt *pgdb.Task, store *pgdb.ExplorationStore, ic *intercept.Inter
 		PlanQuietMode:   pt.PlanQuietMode,
 		CoverageEnabled: pt.CoverageEnabled,
 		FirstRunAt:      unixOrZero(pt.FirstRunAt), DeadlineAt: unixOrZero(pt.DeadlineAt),
-		Store: store, Guard: guard.NewWithInterceptor(ic), notify: make(chan struct{}, 1),
+		Store: store, Guard: guard.NewWithInterceptor(ic), TargetGuard: guard.NewTargetOnly(ic), notify: make(chan struct{}, 1),
+		interceptor: ic,
 	}
+	t.targetGate.Store(pt.TargetGate)
+	return t
+}
+
+// targetScope is the approval scope of this task's tool calls for the target
+// gate. wait bounds how long a gated call may wait for a human decision.
+// Enabled reads the task's opt-in flag on every call, so a switch through the
+// API takes effect on the next tool call.
+func (t *Task) targetScope(wait time.Duration) intercept.TargetScope {
+	return intercept.TargetScope{TaskID: t.ID, Enabled: t.targetGate.Load, WaitBound: wait, Interceptor: t.interceptor}
+}
+
+// searchBackendEndpoints are the endpoints of the search backends. The
+// "deepseek" backend has none of its own: it uses the active LLM profile.
+var searchBackendEndpoints = map[string]string{
+	"ddgs":       "https://html.duckduckgo.com",
+	"brave-free": "https://api.search.brave.com",
+	"tavily":     "https://api.tavily.com",
+	"keenable":   "https://api.keenable.ai",
+}
+
+// targetGateEndpoints lists the endpoints of the platform's own services, which
+// the target gate exempts from approval: every LLM gateway, the search backend
+// in use, and the proxies an agent may name on a command line (the recording
+// proxy, the global egress proxy, the search proxy and each profile's proxy).
+// It is read on every gated call, so the exemptions follow the configuration.
+func (m *Manager) targetGateEndpoints() []string {
+	var out []string
+	profiles, _ := m.pg.ListProfiles()
+	for _, p := range profiles {
+		out = append(out, p.BaseURL, p.Proxy)
+	}
+	on, backend, _, _, _, searchProxy := m.WebSearch()
+	if on {
+		out = append(out, searchBackendEndpoints[backend])
+	}
+	return append(out, searchProxy, m.ProxyAddr(), m.GlobalProxy())
 }
 
 // UpdateTaskMetadata changes list-only task metadata without interrupting any
@@ -899,6 +1026,7 @@ func (m *Manager) UpdateTaskMetadata(taskID string, patch pgdb.TaskPatch) (*Task
 	// Live switch (#86): runRound reads the flag per round, so the next
 	// planning round (edge or heartbeat) already respects the new value.
 	task.PlanQuietMode = updated.PlanQuietMode
+	task.targetGate.Store(updated.TargetGate)
 	return task, nil
 }
 
@@ -1073,12 +1201,12 @@ func (m *Manager) DeleteCompanyWithAssets(id int64, deleteAssets bool) (int64, e
 // ReplaceTaskLLMProfiles resets a task's ordered provider chain and mirrors the
 // committed state onto the live task handle. Terminal tasks are editable too —
 // their main-agent conversation keeps running on the chain after the task finishes.
-func (m *Manager) ReplaceTaskLLMProfiles(id string, profileIDs []int64, activeProfileID int64) (int64, error) {
+func (m *Manager) ReplaceTaskLLMProfiles(id string, profileIDs []int64, activeProfileID int64, rotate ...*bool) (int64, error) {
 	n, err := strconv.ParseInt(id, 10, 64)
 	if err != nil {
 		return 0, err
 	}
-	if err := m.pg.ReplaceTaskLLMProfiles(n, profileIDs, activeProfileID); err != nil {
+	if err := m.pg.ReplaceTaskLLMProfiles(n, profileIDs, activeProfileID, rotate...); err != nil {
 		return 0, err
 	}
 	pt, err := m.pg.GetTask(n)
@@ -1087,7 +1215,7 @@ func (m *Manager) ReplaceTaskLLMProfiles(id string, profileIDs []int64, activePr
 	}
 	m.mu.Lock()
 	if task := m.tasks[id]; task != nil {
-		task.setLLMState(pt.LLMProfileID, pt.ActiveLLMProfileID, pt.LLMProfileIDs, pt.LLMChainRevision, pt.LLMFailoverState, pt.LLMFailoverReason)
+		task.setLLMState(pt.LLMProfileID, pt.ActiveLLMProfileID, pt.LLMProfileIDs, pt.LLMChainRevision, pt.LLMFailoverState, pt.LLMFailoverReason, pt.LLMRotate)
 	}
 	m.mu.Unlock()
 	// Terminal tasks do not reopen budget-blocked intents: no worker is running for
@@ -1218,7 +1346,13 @@ func (m *Manager) ApplyTaskAdmission(id, expectedStatus, status string, queued b
 	        WHEN paused_at IS NOT NULL AND deadline_at IS NOT NULL THEN deadline_at + (now() - paused_at)
 	        ELSE deadline_at
 	    END,
-	    paused_at=NULL
+	    paused_at=NULL,
+	    -- A revive (terminal -> non-terminal) starts a new run: drop the previous
+	    -- run's end reason (e.g. budget) so it never marks the new one.
+	    end_reason=CASE
+	        WHEN $2 NOT IN ('done','failed','timeout') THEN ''
+	        ELSE end_reason
+	    END
 	WHERE id=$1 AND deleted_at IS NULL AND status=$6
 	RETURNING queued_at, queue_mode, completed_at, first_run_at, deadline_at`, n, status, queued, mode, preservePosition, expectedStatus).
 		Scan(&queuedAt, &committedMode, &completedAt, &firstRunAt, &deadlineAt)
@@ -1411,14 +1545,15 @@ func (m *Manager) StampTaskFirstRun(id string) (int64, error) {
 // SetTaskStatusGuarded sets a TERMINAL status only if the task isn't already terminal
 // (resolves the completed↔timeout race — first terminal writer wins). Reflects the
 // won status on the live handle. won=false means another terminal already stuck.
-func (m *Manager) SetTaskStatusGuarded(id, status string) (won bool, err error) {
+// endReason is persisted with the status (empty or db.EndReasonBudget).
+func (m *Manager) SetTaskStatusGuarded(id, status, endReason string) (won bool, err error) {
 	m.taskStateMu.Lock()
 	defer m.taskStateMu.Unlock()
 	n, err := strconv.ParseInt(id, 10, 64)
 	if err != nil {
 		return false, err
 	}
-	won, err = m.pg.SetTerminalStatusGuarded(n, status)
+	won, err = m.pg.SetTerminalStatusGuarded(n, status, endReason)
 	if err != nil || !won {
 		return won, err
 	}
@@ -1621,17 +1756,19 @@ type taskFileDeleteStage struct {
 	done     bool
 }
 
-// stageTaskFiles atomically renames the task workspace and owned transcripts to
-// a same-filesystem staging directory. The trailing dash in the transcript
-// prefix is significant: exploration 12 must not match exploration 123.
+// stageTaskFiles atomically renames the task workspace, its command-output spill
+// directory and owned transcripts to a same-filesystem staging directory. The
+// trailing dash in the transcript prefix is significant: exploration 12 must not
+// match exploration 123.
 func stageTaskFiles(dataDir, taskID string, explorationID int64) (*taskFileDeleteStage, error) {
 	stage := &taskFileDeleteStage{}
 	var targets []string
-	taskDir := filepath.Join(dataDir, "tasks", taskID)
-	if _, err := os.Lstat(taskDir); err == nil {
-		targets = append(targets, taskDir)
-	} else if !os.IsNotExist(err) {
-		return nil, err
+	for _, dir := range []string{filepath.Join(dataDir, "tasks", taskID), agent.TaskSpillDir(dataDir, taskID)} {
+		if _, err := os.Lstat(dir); err == nil {
+			targets = append(targets, dir)
+		} else if !os.IsNotExist(err) {
+			return nil, err
+		}
 	}
 
 	transcriptDir := filepath.Join(dataDir, "transcripts")
@@ -1840,16 +1977,17 @@ func (t *Task) NotifyGoal(texts []string) {
 }
 
 // NotifyHint records that one OR MORE hints were added in a single add_hint call —
-// by the human via the main agent, or by cross-task orchestration — then wakes the
-// planner, so the next round is told "the human added N strategy hints: ..." and looks at them
-// directly instead of having to spot the new hint folded into the graph overview.
+// by the human via the main agent (origin "human"), or by cross-task orchestration
+// (origin "orchestrator") — then wakes the planner, so the next round is told who
+// added N strategy hints and looks at them directly instead of having to spot the
+// new hint folded into the graph overview.
 // One call → one trigger event (a batched add_hint counts as one, not one per hint).
-func (t *Task) NotifyHint(texts []string) {
+func (t *Task) NotifyHint(origin string, texts []string) {
 	if len(texts) == 0 {
 		return
 	}
 	t.trigMu.Lock()
-	t.pendingTriggers = append(t.pendingTriggers, agent.TriggerEvent{Kind: "hint", Hints: texts})
+	t.pendingTriggers = append(t.pendingTriggers, agent.TriggerEvent{Kind: "hint", Hints: texts, HintOrigin: origin})
 	t.trigMu.Unlock()
 	t.Notify()
 }

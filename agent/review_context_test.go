@@ -19,7 +19,7 @@ import (
 func TestWorkerReviewContextAcrossToolCalls(t *testing.T) {
 	dsn, _, err := db.DSN()
 	if err != nil {
-		t.Skip("no test database configured")
+		db.SkipPGUnavailable(t, err)
 	}
 	d, err := db.Open(dsn)
 	if err != nil {
@@ -47,7 +47,7 @@ func TestWorkerReviewContextAcrossToolCalls(t *testing.T) {
 	if err := ic.SetEnabledTools([]string{probeName}); err != nil {
 		t.Fatal(err)
 	}
-	if err := ic.SetJudgeConfig(intercept.JudgeConfig{Enabled: true}); err != nil {
+	if err := ic.SetJudgeConfig(intercept.JudgeConfig{Enabled: true, Mode: intercept.JudgeModeFreeform}); err != nil {
 		t.Fatal(err)
 	}
 	var inputs []intercept.ReviewInput

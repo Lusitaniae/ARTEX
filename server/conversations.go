@@ -7,6 +7,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -27,7 +28,7 @@ const (
 
 func decodeConversationRequest(w http.ResponseWriter, r *http.Request, value any) bool {
 	r.Body = http.MaxBytesReader(w, r.Body, maxConversationRequestBytes)
-	if err := decode(r, value); err != nil {
+	if err := decode(w, r, value); err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
 			writeErr(w, http.StatusRequestEntityTooLarge, "Request body too large")
@@ -79,6 +80,7 @@ func (s *Server) pgCreateConversation(w http.ResponseWriter, r *http.Request) {
 		AgentKey     string `json:"agent_key"`
 		Title        string `json:"title"`
 		LLMProfileID *int64 `json:"llm_profile_id"`
+		TargetGate   bool   `json:"target_gate"` // approval gate for asset targets, opt-in
 	}
 	if !decodeConversationRequest(w, r, &req) {
 		return
@@ -115,7 +117,7 @@ func (s *Server) pgCreateConversation(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, fmt.Sprintf("Title must be at most %d characters", maxConversationTitleRunes))
 		return
 	}
-	c, err := pg.CreateConversation(req.AgentKey, title, req.LLMProfileID)
+	c, err := pg.CreateConversationGated(req.AgentKey, title, req.LLMProfileID, req.TargetGate)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -176,14 +178,15 @@ func (s *Server) pgRenameConversation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Title  *string `json:"title"`
-		Pinned *bool   `json:"pinned"`
+		Title      *string `json:"title"`
+		Pinned     *bool   `json:"pinned"`
+		TargetGate *bool   `json:"target_gate"`
 	}
 	if !decodeConversationRequest(w, r, &req) {
 		return
 	}
-	if req.Title == nil && req.Pinned == nil {
-		writeErr(w, 400, "Provide at least title or pinned")
+	if req.Title == nil && req.Pinned == nil && req.TargetGate == nil {
+		writeErr(w, 400, "Provide at least title, pinned or target_gate")
 		return
 	}
 	if req.Title != nil {
@@ -198,7 +201,7 @@ func (s *Server) pgRenameConversation(w http.ResponseWriter, r *http.Request) {
 		}
 		req.Title = &title
 	}
-	updated, err := pg.UpdateConversation(c.ID, db.ConversationPatch{Title: req.Title, Pinned: req.Pinned})
+	updated, err := pg.UpdateConversation(c.ID, db.ConversationPatch{Title: req.Title, Pinned: req.Pinned, TargetGate: req.TargetGate})
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -221,7 +224,17 @@ func (s *Server) pgDeleteConversation(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	s.removeConversationSpill(c.ID)
 	writeJSON(w, 200, map[string]any{"deleted": c.ID})
+}
+
+// removeConversationSpill removes the command-output spill directory of a deleted
+// conversation's chat session (<data>/spill/sessions/conv-<id>).
+func (s *Server) removeConversationSpill(id int64) {
+	dir := agent.SessionSpillDir(s.m.dir, s.convBusyKey(id))
+	if err := os.RemoveAll(dir); err != nil {
+		log.Printf("[conv %d] remove the spill directory %s: %v", id, dir, err)
+	}
 }
 
 const maxConversationDeleteBatch = 100
@@ -285,6 +298,7 @@ func (s *Server) pgDeleteConversationsBatch(w http.ResponseWriter, r *http.Reque
 	deletedSet := make(map[int64]struct{}, len(deleted))
 	for _, id := range deleted {
 		deletedSet[id] = struct{}{}
+		s.removeConversationSpill(id)
 	}
 	items := make([]conversationDeleteItem, 0, len(ids))
 	for _, id := range ids {
@@ -309,16 +323,16 @@ func (s *Server) pgConversationMessages(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	q := r.URL.Query()
-	limit := atoiDefault(q.Get("limit"), 200)
 	s.chatMu.Lock()
 	running := s.chatBusy[s.convBusyKey(c.ID)]
 	s.chatMu.Unlock()
 
 	// Incremental tail: ?since=N returns steps after id N (ASC) — used by the live
-	// poll and the post-send fetch. A generous cap so a burst is never dropped.
+	// poll and the post-send fetch. Capped so a huge limit cannot materialise the
+	// whole transcript in one response.
 	if sv := q.Get("since"); sv != "" {
 		since, _ := strconv.ParseInt(sv, 10, 64)
-		items, cursor, err := pg.ConvActivityList(c.ID, since, max(limit, 1000))
+		items, cursor, err := pg.ConvActivityList(c.ID, since, 1000)
 		if err != nil {
 			writeErr(w, 500, err.Error())
 			return
@@ -331,7 +345,7 @@ func (s *Server) pgConversationMessages(w http.ResponseWriter, r *http.Request) 
 	// the page of older steps ending before id N. hasMore lets the client stop
 	// loading earlier history once the top of the thread is reached.
 	before, _ := strconv.ParseInt(q.Get("before"), 10, 64)
-	items, hasMore, err := pg.ConvActivityPage(c.ID, before, limit)
+	items, hasMore, err := pg.ConvActivityPage(c.ID, before, convMessageLimit(q.Get("limit"), 200, 200))
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return
@@ -341,6 +355,19 @@ func (s *Server) pgConversationMessages(w http.ResponseWriter, r *http.Request) 
 		cursor = items[n-1].ID
 	}
 	writeJSON(w, 200, map[string]any{"items": activityDTOs(items), "cursor": cursor, "running": running, "hasMore": hasMore})
+}
+
+// convMessageLimit clamps a page size. Missing or invalid values use def; the
+// result is at most cap so a huge query cannot materialise the whole transcript.
+func convMessageLimit(raw string, maxN, def int) int {
+	n := atoiDefault(raw, def)
+	if n < 1 {
+		n = def
+	}
+	if n > maxN {
+		n = maxN
+	}
+	return n
 }
 
 // pgConversationMsgDetail lazily returns one step's full detail blob.
@@ -394,7 +421,7 @@ func (s *Server) pgSendConversationMessage(w http.ResponseWriter, r *http.Reques
 		Message     string           `json:"message"`
 		Attachments []chatAttachment `json:"attachments,omitempty"` // files uploaded via method 1 (paths relative to the conversation working dir)
 	}
-	if err := decode(r, &req); err != nil {
+	if err := decode(w, r, &req); err != nil {
 		writeErr(w, 400, err.Error())
 		return
 	}
@@ -558,9 +585,15 @@ func (s *Server) runConversationTurn(ctx context.Context, cancel context.CancelC
 			log.Printf("[conv %d] append activity failed: %v", c.ID, err)
 		}
 	}
+	// Approval scope of this turn's tool calls for the target gate (chat and retester).
+	// The conversation's opt-in flag is the one read when the turn started: a
+	// switch through the API applies from the next turn.
+	gate := c.TargetGate
+	gctx := intercept.WithTargetScope(ctx, intercept.TargetScope{ConversationID: c.ID, Enabled: func() bool { return gate },
+		WaitBound: intercept.DefaultTargetWaitBound, Interceptor: s.m.interceptor})
 	// On a manual stop ctx is cancelled; Chat already emits a clean "stopped by the user"
 	// step, so skip the raw-error entry — only surface genuine failures.
-	if _, err := ca.Chat(ctx, c.AgentKey, sessionID, msg, maxTurns, maxDuration, webSearch, emit); err != nil {
+	if _, err := ca.Chat(gctx, c.AgentKey, sessionID, msg, maxTurns, maxDuration, webSearch, emit); err != nil {
 		finishReason = err.Error()
 		if ctx.Err() == nil {
 			_, _ = pg.AppendConvActivity(c.ID, db.Activity{Worker: c.AgentKey, Kind: "text", IsError: true,
@@ -612,9 +645,14 @@ func (s *Server) StartTriggeredRun(agentKey, title, message string, taskID int64
 		return
 	}
 	cfg := s.readTriggerBehavior(agentKey) // DB read BEFORE the lock (never under queueMu)
+	// A conversation triggered by a gated task is gated (the flag only, never pins).
+	gated := false
+	if t, ok := s.m.Task(strconv.FormatInt(taskID, 10)); ok && taskID > 0 {
+		gated = t.targetGate.Load()
+	}
 	s.queueMu.Lock()
 	s.triggerCfg[agentKey] = cfg
-	s.triggerQ[agentKey] = append(s.triggerQ[agentKey], triggeredRun{agentKey: agentKey, title: title, message: message, taskID: taskID, taskDesc: taskDesc, taskGoal: taskGoal, mergeable: mergeable})
+	s.triggerQ[agentKey] = append(s.triggerQ[agentKey], triggeredRun{agentKey: agentKey, title: title, message: message, taskID: taskID, taskDesc: taskDesc, taskGoal: taskGoal, mergeable: mergeable, targetGate: gated})
 	s.pumpLocked(agentKey)
 	s.queueMu.Unlock()
 }
@@ -741,13 +779,24 @@ func mergeTriggeredRuns(items []triggeredRun) triggeredRun {
 		fmt.Fprintf(&b, "\n── trigger %d ──\n%s\n", i+1, it.message)
 	}
 	return triggeredRun{
-		agentKey:  first.agentKey,
-		title:     fmt.Sprintf("Merged triggers · task#%d · %d items", first.taskID, len(items)),
-		message:   b.String(),
-		taskID:    first.taskID,
-		mergeable: true,
+		agentKey:   first.agentKey,
+		title:      fmt.Sprintf("Merged triggers · task#%d · %d items", first.taskID, len(items)),
+		message:    b.String(),
+		taskID:     first.taskID,
+		mergeable:  true,
+		targetGate: anyTriggerGated(items),
 		// taskDesc/taskGoal left empty: header already embedded above.
 	}
+}
+
+// anyTriggerGated reports whether any fire of a merged run came from a gated task.
+func anyTriggerGated(items []triggeredRun) bool {
+	for _, it := range items {
+		if it.targetGate {
+			return true
+		}
+	}
+	return false
 }
 
 // mergeAllRuns folds the ENTIRE queued burst into one run (merge_mode='all'),
@@ -783,11 +832,12 @@ func mergeAllRuns(items []triggeredRun) triggeredRun {
 		}
 	}
 	return triggeredRun{
-		agentKey:  first.agentKey,
-		title:     fmt.Sprintf("Merged triggers · all · %d items", len(items)),
-		message:   b.String(),
-		taskID:    first.taskID,
-		mergeable: true,
+		agentKey:   first.agentKey,
+		title:      fmt.Sprintf("Merged triggers · all · %d items", len(items)),
+		message:    b.String(),
+		taskID:     first.taskID,
+		mergeable:  true,
+		targetGate: anyTriggerGated(items),
 		// taskDesc/taskGoal left empty: per-task headers already embedded above.
 	}
 }
@@ -802,7 +852,7 @@ func (s *Server) runTriggeredRun(item triggeredRun) {
 		}
 	}()
 	pg := s.m.pg
-	c, err := pg.CreateConversation(item.agentKey, firstLine(item.title, 60), nil)
+	c, err := pg.CreateConversationGated(item.agentKey, firstLine(item.title, 60), nil, item.targetGate)
 	if err != nil {
 		log.Printf("[trigger] create conversation for %s failed: %v", item.agentKey, err)
 		return

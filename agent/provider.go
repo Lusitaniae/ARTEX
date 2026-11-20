@@ -1,5 +1,5 @@
 // Package agent wires real LLM-driven planner and work agents (on top of the
-// agent-core SDK) to the dual SQLite graph. See the ARTEX architecture design doc
+// agent-core SDK) to the dual PostgreSQL graph. See the ARTEX architecture design doc
 // §4.3 (planner) and §4.4 (work agent).
 //
 // Provider configuration is read from the environment so the system runs with
@@ -27,6 +27,7 @@ import (
 	"github.com/Autumn-27/norma/compaction"
 	"github.com/Autumn-27/norma/llm"
 	acperm "github.com/Autumn-27/norma/permission"
+	actool "github.com/Autumn-27/norma/tool"
 	"github.com/Autumn-27/norma/transcript"
 )
 
@@ -44,8 +45,9 @@ type Config struct {
 	// using the provider (0 = that window unlimited).
 	RatePerSecond float64
 	RatePerMinute float64
-	// ContextWindowK is the model's context window in K tokens (user-configured),
-	// used to size compaction thresholds. 0 = default; see CompactionWindow.
+	// ContextWindowK is the model's context window in K tokens (user-configured).
+	// CompactionWindow applies a 32K floor for compaction math; ContextWindowTokens
+	// does not, so routing and side-question budgets see the real window. 0 = default.
 	ContextWindowK int
 	// ThinkingType independently controls the thinking "on/off" field (thinking.type):
 	//   "" = don't send (default, compatible with models that don't support the field);
@@ -86,6 +88,10 @@ type Config struct {
 	// context via transcript.WithSessionID and read by the RoundTripper, so even a
 	// shared provider emits different header values per session.
 	SessionHeaderKey string
+	// UserAgent, when non-empty, overrides the User-Agent header on every outbound
+	// LLM request built from this config. Empty = don't set it, leaving the Go/Norma
+	// default UA untouched (the historical behavior). Validated by ValidateUserAgent.
+	UserAgent string
 	// Retry holds the retry parameters resolved for this config (profile override →
 	// global policy → built-in default, resolved server-side). See RetryConfig for
 	// the per-layer semantics; zero values = fully inherit the built-in defaults.
@@ -178,6 +184,22 @@ func (c Config) CompactionWindow() int {
 	}
 	if k < minWindowK {
 		k = minWindowK
+	}
+	if k > maxWindowK {
+		k = maxWindowK
+	}
+	return k * 1000
+}
+
+// ContextWindowTokens returns the model's actual configured context window in
+// tokens (0/unset → 200K, capped at 1M) without the 32K compaction-math floor.
+// llmpool pre-filtering and sidequestion budgets use this so an 8K/16K profile
+// is not treated as 32K — that leak lets an oversize request hit the small
+// model, 400, and never fail over (shouldFailover ignores 400s).
+func (c Config) ContextWindowTokens() int {
+	k := c.ContextWindowK
+	if k <= 0 {
+		k = defaultWindowK
 	}
 	if k > maxWindowK {
 		k = maxWindowK
@@ -341,7 +363,7 @@ func (c Config) Provider() string {
 // limiter lives on the single provider instance — so planner + all workers +
 // main agent (which share this provider) are bounded by one shared rate limit.
 func (c Config) NewProvider() (llm.Provider, error) {
-	client, err := quotaAwareHTTPClient(c.Proxy, c.SessionHeaderKey)
+	client, err := quotaAwareHTTPClient(c.Proxy, c.SessionHeaderKey, c.UserAgent)
 	if err != nil {
 		return nil, err
 	}
@@ -440,6 +462,9 @@ type quotaAwareTransport struct {
 	// carries; its value is the session id read from the request context. Empty
 	// disables it. See Config.SessionHeaderKey.
 	sessionHeaderKey string
+	// userAgent, when non-empty, is set as the User-Agent header on every request.
+	// Empty leaves the default UA untouched. See Config.UserAgent.
+	userAgent string
 }
 
 func (t quotaAwareTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -451,6 +476,11 @@ func (t quotaAwareTransport) RoundTrip(req *http.Request) (*http.Response, error
 		if sid := transcript.SessionIDFrom(req.Context()); sid != "" {
 			req.Header.Set(t.sessionHeaderKey, sid)
 		}
+	}
+	// Custom User-Agent: override only when configured, so an empty value keeps the
+	// underlying transport's default UA exactly as before.
+	if t.userAgent != "" {
+		req.Header.Set("User-Agent", t.userAgent)
 	}
 	// When LLM recording is on, the Recorder puts a Capture on the context so the
 	// raw wire bodies can be persisted. This is the only layer that still sees
@@ -504,7 +534,7 @@ func requestBodySnapshot(req *http.Request) string {
 	return string(b)
 }
 
-func quotaAwareHTTPClient(proxy, sessionHeaderKey string) (*http.Client, error) {
+func quotaAwareHTTPClient(proxy, sessionHeaderKey, userAgent string) (*http.Client, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	proxy = strings.TrimSpace(proxy)
 	if proxy == "" {
@@ -523,7 +553,31 @@ func quotaAwareHTTPClient(proxy, sessionHeaderKey string) (*http.Client, error) 
 		}
 		transport.Proxy = http.ProxyURL(proxyURL)
 	}
-	return &http.Client{Transport: quotaAwareTransport{base: transport, sessionHeaderKey: strings.TrimSpace(sessionHeaderKey)}}, nil
+	return &http.Client{Transport: quotaAwareTransport{base: transport, sessionHeaderKey: strings.TrimSpace(sessionHeaderKey), userAgent: strings.TrimSpace(userAgent)}}, nil
+}
+
+// MaxUserAgentLen bounds a custom User-Agent value. Generous for real UA strings
+// while keeping a pathological value out of every outbound request.
+const MaxUserAgentLen = 256
+
+// ValidateUserAgent trims a custom User-Agent and returns the cleaned value. An
+// empty/blank input is valid and means "no override" (keep the default UA). A
+// non-empty value is rejected when it exceeds MaxUserAgentLen or contains any
+// control character (including CR/LF, which would allow header injection).
+func ValidateUserAgent(raw string) (string, error) {
+	ua := strings.TrimSpace(raw)
+	if ua == "" {
+		return "", nil
+	}
+	if len(ua) > MaxUserAgentLen {
+		return "", fmt.Errorf("user agent too long: %d bytes (max %d)", len(ua), MaxUserAgentLen)
+	}
+	for _, r := range ua {
+		if r < 0x20 || r == 0x7f {
+			return "", fmt.Errorf("user agent contains a control character")
+		}
+	}
+	return ua, nil
 }
 
 // logTestConnection prints the raw HTTP status code(s) and response body of a
@@ -595,6 +649,7 @@ func TestConnection(ctx context.Context, c Config) (time.Duration, string, error
 	reply, err := agentcore.Run(ctx, agentcore.Options{
 		Provider:       prov,
 		SystemPrompt:   []string{"You are a connection test. Just output the two characters OK — no thinking, no explanation, nothing else."},
+		Tools:          []actool.CoreTool{}, // not nil: nil means the SDK's unconfined file and shell tools
 		PermissionMode: acperm.ModeBypass,
 		MaxTurns:       1,
 		MaxTokens:      8192,
